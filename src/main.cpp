@@ -734,13 +734,6 @@ private:
 
     template <typename Writer>
     void submit_frame(MppFrame frame, Writer writer) {
-        MppPacket packet = nullptr;
-        if (mpp_packet_init_with_buffer(&packet, packet_buf_)) die("mpp_packet_init_with_buffer failed");
-        mpp_packet_set_length(packet, 0);
-
-        MppMeta meta = mpp_frame_get_meta(frame);
-        mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, packet);
-
         MPP_RET ret = mpi_->encode_put_frame(ctx_, frame);
         mpp_frame_deinit(&frame);
         if (ret) die("encode_put_frame failed");
@@ -756,8 +749,6 @@ private:
                 owner,
             };
             writer(encoded);
-        } else {
-            mpp_packet_deinit(&packet);
         }
     }
 

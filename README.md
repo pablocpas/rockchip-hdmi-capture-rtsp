@@ -42,25 +42,57 @@ Hardware:
 - UVC HDMI capture dongle that exposes MJPEG at the target resolution/FPS.
 - USB bandwidth for the selected capture mode.
 
-Debian/Ubuntu packages, names may vary by image/vendor:
+Runtime packages for release binaries:
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential cmake pkg-config git \
   v4l-utils alsa-utils \
+  libv4l-0 libturbojpeg0 libasound2 libopus0
+```
+
+You also need Rockchip MPP runtime libraries from your board vendor image or
+packages. Package names vary; on some images they are included by default.
+
+Build packages, only needed if compiling from source:
+
+```bash
+sudo apt install -y \
+  build-essential cmake pkg-config git \
   libv4l-dev libturbojpeg0-dev libasound2-dev libopus-dev
 ```
 
-You also need Rockchip MPP development headers and pkg-config metadata, usually
-provided by a vendor package such as `librockchip-mpp-dev` or the board image.
-Check with:
+For source builds you also need Rockchip MPP development headers and pkg-config
+metadata, usually provided by a vendor package such as `librockchip-mpp-dev` or
+the board image. Check with:
 
 ```bash
 pkg-config --modversion rockchip_mpp
 ```
 
-## Build
+## Install From Release Binary
+
+Download the latest `linux-aarch64` tarball from GitHub Releases, then:
+
+```bash
+tar -xzf rockchip-hdmi-capture-rtsp-*-linux-aarch64.tar.gz
+cd rockchip-hdmi-capture-rtsp-*-linux-aarch64
+sudo install -m 755 bin/rk-hdmi-streamer /usr/local/bin/rk-hdmi-streamer
+```
+
+Install the direct RTSP service:
+
+```bash
+sudo install -m 644 systemd/rk-hdmi-streamer.env /etc/default/rk-hdmi-streamer
+sudo install -m 644 systemd/rk-hdmi-streamer-direct.service /etc/systemd/system/rk-hdmi-streamer.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now rk-hdmi-streamer.service
+```
+
+The release binary is dynamically linked and built for Linux `aarch64`. It still
+requires compatible runtime libraries on the target Rockchip system.
+
+## Build From Source
 
 ```bash
 git clone https://github.com/YOUR_USER/rockchip-hdmi-capture-rtsp.git
@@ -76,6 +108,19 @@ sudo cmake --install build
 ```
 
 This installs `rk-hdmi-streamer` to `/usr/local/bin` by default.
+
+To build a release tarball from a Rockchip board:
+
+```bash
+scripts/package-release.sh v0.1.0
+```
+
+The generated files are written to `dist/`:
+
+```text
+rockchip-hdmi-capture-rtsp-v0.1.0-linux-aarch64.tar.gz
+rockchip-hdmi-capture-rtsp-v0.1.0-linux-aarch64.tar.gz.sha256
+```
 
 ## Find Capture Devices
 

@@ -34,15 +34,20 @@ H.264 hardware encoding, MJPEG hardware decoding, Opus audio, WireGuard.
 - Hardware acceleration depends on the board image exposing working Rockchip MPP
   headers, libraries, and runtime support.
 
-## Requirements
-
-Hardware:
+## Hardware Requirements
 
 - Rockchip board with MPP support, for example RK3568/RK3588-class boards.
 - UVC HDMI capture dongle that exposes MJPEG at the target resolution/FPS.
 - USB bandwidth for the selected capture mode.
 
-Runtime packages for release binaries:
+## Installation
+
+The easiest path is to install a prebuilt `linux-aarch64` release binary. This
+does not require build tools, CMake, compiler packages, or development headers.
+
+### Runtime Requirements
+
+Install runtime tools and shared libraries:
 
 ```bash
 sudo apt update
@@ -54,23 +59,7 @@ sudo apt install -y \
 You also need Rockchip MPP runtime libraries from your board vendor image or
 packages. Package names vary; on some images they are included by default.
 
-Build packages, only needed if compiling from source:
-
-```bash
-sudo apt install -y \
-  build-essential cmake pkg-config git \
-  libv4l-dev libturbojpeg0-dev libasound2-dev libopus-dev
-```
-
-For source builds you also need Rockchip MPP development headers and pkg-config
-metadata, usually provided by a vendor package such as `librockchip-mpp-dev` or
-the board image. Check with:
-
-```bash
-pkg-config --modversion rockchip_mpp
-```
-
-## Install From Release Binary
+### Install From Release Binary
 
 Download the latest `linux-aarch64` tarball from GitHub Releases, then:
 
@@ -92,10 +81,34 @@ sudo systemctl enable --now rk-hdmi-streamer.service
 The release binary is dynamically linked and built for Linux `aarch64`. It still
 requires compatible runtime libraries on the target Rockchip system.
 
-## Build From Source
+## Build Instructions
+
+Only follow this section if you want to compile from source or create your own
+release binary.
+
+### Build Requirements
+
+Install build tools and development headers:
 
 ```bash
-git clone https://github.com/YOUR_USER/rockchip-hdmi-capture-rtsp.git
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config git \
+  libv4l-dev libturbojpeg0-dev libasound2-dev libopus-dev
+```
+
+You also need Rockchip MPP development headers and pkg-config metadata, usually
+provided by a vendor package such as `librockchip-mpp-dev` or the board image.
+Check with:
+
+```bash
+pkg-config --modversion rockchip_mpp
+```
+
+### Build From Source
+
+```bash
+git clone https://github.com/pablocpas/rockchip-hdmi-capture-rtsp.git
 cd rockchip-hdmi-capture-rtsp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
@@ -108,6 +121,8 @@ sudo cmake --install build
 ```
 
 This installs `rk-hdmi-streamer` to `/usr/local/bin` by default.
+
+### Build A Release Tarball
 
 To build a release tarball from a Rockchip board:
 

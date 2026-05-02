@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <alsa/asoundlib.h>
@@ -633,6 +634,20 @@ private:
     bool logged_layout_ = false;
 };
 
+struct MppPacketDeleter {
+    void operator()(MppPacket packet) const {
+        if (packet) mpp_packet_deinit(&packet);
+    }
+};
+
+using SharedMppPacket = std::shared_ptr<std::remove_pointer<MppPacket>::type>;
+
+struct EncodedPacket {
+    const uint8_t *data = nullptr;
+    size_t len = 0;
+    SharedMppPacket mpp_packet;
+};
+
 class MppH264Encoder {
 public:
     explicit MppH264Encoder(const Options &opt,
@@ -734,8 +749,13 @@ private:
         ret = mpi_->encode_get_packet(ctx_, &out);
         if (ret) die("encode_get_packet failed");
         if (out) {
-            writer(static_cast<const uint8_t *>(mpp_packet_get_pos(out)), mpp_packet_get_length(out));
-            mpp_packet_deinit(&out);
+            SharedMppPacket owner(out, MppPacketDeleter{});
+            EncodedPacket encoded{
+                static_cast<const uint8_t *>(mpp_packet_get_pos(out)),
+                mpp_packet_get_length(out),
+                owner,
+            };
+            writer(encoded);
         } else {
             mpp_packet_deinit(&packet);
         }
@@ -933,6 +953,7 @@ class MediaOutput {
 public:
     virtual ~MediaOutput() = default;
     virtual void write_frame(const uint8_t *data, size_t len) = 0;
+    virtual void write_packet(const EncodedPacket &packet) { write_frame(packet.data, packet.len); }
     virtual void write_audio_l16_s16le(const int16_t *samples, size_t frames) = 0;
     virtual void write_audio_payload(const uint8_t *payload, size_t len, size_t frames) = 0;
     virtual void log_stats() = 0;
@@ -1396,8 +1417,25 @@ public:
     void write_frame(const uint8_t *data, size_t len) override {
         if (!has_clients()) return;
 
-        auto frame = std::make_shared<std::vector<uint8_t>>(data, data + len);
-        auto nals = parse_annexb(frame->data(), frame->size());
+        EncodedPacket packet{data, len, {}};
+        write_packet(packet);
+    }
+
+    void write_packet(const EncodedPacket &packet) override {
+        if (!has_clients() || !packet.data || packet.len == 0) return;
+
+        RtpStorage storage;
+        storage.packet = packet.mpp_packet;
+        if (storage.packet) {
+            storage.data = packet.data;
+            storage.size = packet.len;
+        } else {
+            storage.bytes = std::make_shared<std::vector<uint8_t>>(packet.data, packet.data + packet.len);
+            storage.data = storage.bytes->data();
+            storage.size = storage.bytes->size();
+        }
+
+        auto nals = parse_annexb(storage.data, storage.size);
         if (nals.empty()) return;
 
         size_t last_payload_nal = nals.size();
@@ -1411,12 +1449,12 @@ public:
         if (last_payload_nal == nals.size()) return;
 
         std::vector<RtpChunk> chunks;
-        chunks.reserve(nals.size() + frame->size() / max_payload_ + 1);
+        chunks.reserve(nals.size() + storage.size / max_payload_ + 1);
         for (size_t i = 0; i < nals.size(); ++i) {
             uint8_t type = nals[i].data[0] & 0x1f;
             if (type == 9) continue;
-            size_t offset = static_cast<size_t>(nals[i].data - frame->data());
-            add_video_nal(chunks, frame, offset, nals[i].size, i == last_payload_nal);
+            size_t offset = static_cast<size_t>(nals[i].data - storage.data);
+            add_video_nal(chunks, storage, offset, nals[i].size, i == last_payload_nal);
         }
         broadcast(chunks);
         video_timestamp_ += 90000 / fps_;
@@ -1438,7 +1476,9 @@ public:
         chunk.payload_type = 97;
         chunk.timestamp = audio_timestamp_;
         chunk.marker = audio_marker_;
-        chunk.storage = payload;
+        chunk.storage.bytes = payload;
+        chunk.storage.data = payload->data();
+        chunk.storage.size = payload->size();
         chunk.offset = 0;
         chunk.size = payload->size();
         audio_marker_ = false;
@@ -1454,7 +1494,9 @@ public:
         chunk.payload_type = 97;
         chunk.timestamp = audio_timestamp_;
         chunk.marker = audio_marker_;
-        chunk.storage = data;
+        chunk.storage.bytes = data;
+        chunk.storage.data = data->data();
+        chunk.storage.size = data->size();
         chunk.offset = 0;
         chunk.size = data->size();
         audio_marker_ = false;
@@ -1485,12 +1527,19 @@ public:
     }
 
 private:
+    struct RtpStorage {
+        SharedMppPacket packet;
+        std::shared_ptr<std::vector<uint8_t>> bytes;
+        const uint8_t *data = nullptr;
+        size_t size = 0;
+    };
+
     struct RtpChunk {
         uint8_t channel = 0;
         uint8_t payload_type = 96;
         uint32_t timestamp = 0;
         bool marker = false;
-        std::shared_ptr<std::vector<uint8_t>> storage;
+        RtpStorage storage;
         size_t offset = 0;
         size_t size = 0;
         uint8_t prefix[2] = {};
@@ -1724,7 +1773,7 @@ private:
                 {interleaved, sizeof(interleaved)},
                 {rtp, sizeof(rtp)},
                 {const_cast<uint8_t *>(chunk.prefix), chunk.prefix_size},
-                {chunk.storage->data() + chunk.offset, chunk.size},
+                {const_cast<uint8_t *>(chunk.storage.data + chunk.offset), chunk.size},
             };
             iovec *cur = iov;
             int iovcnt = 4;
@@ -1889,7 +1938,7 @@ private:
     }
 
     void add_video_nal(std::vector<RtpChunk> &chunks,
-                       const std::shared_ptr<std::vector<uint8_t>> &storage,
+                       const RtpStorage &storage,
                        size_t offset,
                        size_t len,
                        bool marker) {
@@ -1906,7 +1955,7 @@ private:
             return;
         }
 
-        uint8_t nal_header = (*storage)[offset];
+        uint8_t nal_header = storage.data[offset];
         uint8_t fu_indicator = (nal_header & 0xe0) | 28;
         uint8_t nal_type = nal_header & 0x1f;
         size_t pos = 1;
@@ -2323,9 +2372,9 @@ int main(int argc, char **argv) {
 
         if (!serve_rtsp) start_capture();
 
-        auto writer = [&](const uint8_t *data, size_t len) {
-            if (serve_rtsp || publish_rtsp) media_output->write_frame(data, len);
-            else out->write(data, len);
+        auto writer = [&](const EncodedPacket &packet) {
+            if (serve_rtsp || publish_rtsp) media_output->write_packet(packet);
+            else out->write(packet.data, packet.len);
         };
 
         while (opt.frames == 0 || total_encoded < opt.frames) {

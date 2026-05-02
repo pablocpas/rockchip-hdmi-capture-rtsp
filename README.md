@@ -10,9 +10,6 @@ server can waste too much CPU.
 Tested on a NanoPi R3S LTS with RK3568 and a MacroSilicon/MS2109-style UVC HDMI
 capture dongle at 1080p30.
 
-Keywords: Rockchip MPP, RK3568, RK3588, HDMI capture, UVC capture card, RTSP,
-H.264 hardware encoding, MJPEG hardware decoding, Opus audio, WireGuard.
-
 ## Features
 
 - 1080p30 MJPEG capture from V4L2/UVC.

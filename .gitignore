@@ -1,0 +1,16 @@
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.d
+*.log
+*.h264
+core
+core.*
+.cache/
+.vscode/
+.idea/

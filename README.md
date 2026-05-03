@@ -161,7 +161,7 @@ rk-hdmi-streamer \
   --decoder mppjpeg \
   --v4l2-dmabuf \
   --device /dev/video0 \
-  --audio-device plughw:CARD=MS2109,DEV=0 \
+  --audio-device hw:CARD=MS2109,DEV=0 \
   --audio-codec opus \
   --audio-gain 3.0 \
   --width 1920 \
@@ -169,7 +169,7 @@ rk-hdmi-streamer \
   --fps 30 \
   --bitrate 12000000 \
   --gop 30 \
-  --rtp-payload 1400 \
+  --rtp-payload 12000 \
   --listen-rtsp :8554 \
   --rtsp-path /capture \
   --max-clients 3
@@ -229,14 +229,14 @@ rk-hdmi-streamer \
   --decoder mppjpeg \
   --v4l2-dmabuf \
   --device /dev/video0 \
-  --audio-device plughw:CARD=MS2109,DEV=0 \
+  --audio-device hw:CARD=MS2109,DEV=0 \
   --audio-codec opus \
   --width 1920 \
   --height 1080 \
   --fps 30 \
   --bitrate 12000000 \
   --gop 30 \
-  --rtp-payload 1400 \
+  --rtp-payload 12000 \
   --output rtsp://127.0.0.1:8554/capture
 ```
 
@@ -291,7 +291,7 @@ rk-hdmi-streamer \
   --decoder mppjpeg \
   --v4l2-dmabuf \
   --device /dev/video0 \
-  --audio-device plughw:CARD=MS2109,DEV=0 \
+  --audio-device hw:CARD=MS2109,DEV=0 \
   --audio-codec opus \
   --audio-gain 3.0 \
   --width 1920 \
@@ -299,7 +299,7 @@ rk-hdmi-streamer \
   --fps 30 \
   --bitrate 12000000 \
   --gop 30 \
-  --rtp-payload 1400 \
+  --rtp-payload 12000 \
   --listen-rtsp :8554 \
   --rtsp-path /capture \
   --max-clients 3
@@ -318,8 +318,10 @@ transcoding, but it still added process, socket, RTP forwarding, and buffering
 overhead that is avoidable for this small-client use case.
 
 During the direct RTSP test, network output was around 12 Mbps with Opus audio
-enabled and no queue drops. With `--rtp-payload 1400`, packetization overhead and
-`sendmsg` calls are reduced compared with the earlier 1200-byte RTP payload.
+enabled and no queue drops. With RTSP/TCP interleaving, `--rtp-payload 12000`
+keeps RTP packets well below the protocol length limit while avoiding thousands
+of small packetization, queue, and `sendmsg` operations per second. Use a smaller
+payload only when a specific client or relay requires it.
 
 These numbers are workload-specific. CPU usage changes with bitrate, client
 count, kernel, MPP version, capture dongle, memory clocks, and whether the stream

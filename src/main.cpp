@@ -44,7 +44,7 @@ namespace {
 
 struct Options {
     std::string device = "/dev/video0";
-    std::string audio_device = "plughw:CARD=MS2109,DEV=0";
+    std::string audio_device = "hw:CARD=MS2109,DEV=0";
     std::string audio_codec = "l16";
     std::string output = "-";
     std::string decoder = "mppjpeg";
@@ -53,7 +53,7 @@ struct Options {
     double audio_gain = 1.0;
     bool audio = true;
     bool v4l2_dmabuf = false;
-    int rtp_payload_size = 1400;
+    int rtp_payload_size = 12000;
     int max_clients = 3;
     int width = 1920;
     int height = 1080;
@@ -83,10 +83,10 @@ void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options]\n"
             "  --device PATH      V4L2 device (default /dev/video0)\n"
-            "  --audio-device ID  ALSA capture device (default plughw:CARD=MS2109,DEV=0)\n"
+            "  --audio-device ID  ALSA capture device (default hw:CARD=MS2109,DEV=0)\n"
             "  --audio-codec NAME  l16 or opus, if built with libopus (default l16)\n"
             "  --audio-gain N     PCM gain before encoding (default 1.0)\n"
-            "  --rtp-payload N    Max RTP payload bytes (default 1400)\n"
+            "  --rtp-payload N    Max RTP payload bytes (default 12000)\n"
             "  --no-audio         Disable RTSP audio track\n"
             "  --v4l2-dmabuf      Capture V4L2 MJPEG directly into MPP/DRM dma-buf buffers\n"
             "  --output PATH      H.264 Annex-B output path or - for stdout (default -)\n"
@@ -865,8 +865,27 @@ struct NalUnit {
     size_t size = 0;
 };
 
+bool strip_annexb_start_code(const uint8_t **data, size_t *size) {
+    if (*size >= 4 && (*data)[0] == 0 && (*data)[1] == 0 && (*data)[2] == 0 && (*data)[3] == 1) {
+        *data += 4;
+        *size -= 4;
+        return true;
+    }
+    if (*size >= 3 && (*data)[0] == 0 && (*data)[1] == 0 && (*data)[2] == 1) {
+        *data += 3;
+        *size -= 3;
+        return true;
+    }
+    return false;
+}
+
 size_t find_start_code(const uint8_t *data, size_t size, size_t pos, size_t *prefix) {
-    for (size_t i = pos; i + 3 <= size; ++i) {
+    size_t i = pos;
+    while (i + 3 <= size) {
+        const void *next_zero = memchr(data + i, 0, size - i - 2);
+        if (!next_zero) return size;
+        i = static_cast<const uint8_t *>(next_zero) - data;
+
         if (i + 4 <= size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
             *prefix = 4;
             return i;
@@ -875,6 +894,7 @@ size_t find_start_code(const uint8_t *data, size_t size, size_t pos, size_t *pre
             *prefix = 3;
             return i;
         }
+        ++i;
     }
     return size;
 }
@@ -894,6 +914,37 @@ std::vector<NalUnit> parse_annexb(const uint8_t *data, size_t size) {
         prefix = next_prefix;
     }
     return out;
+}
+
+std::vector<NalUnit> nals_from_mpp_segments(const EncodedPacket &packet) {
+    std::vector<NalUnit> out;
+    if (!packet.mpp_packet || !packet.data || packet.len == 0) return out;
+
+    MppPacket mpp_packet = packet.mpp_packet.get();
+    RK_U32 segment_nb = mpp_packet_get_segment_nb(mpp_packet);
+    const MppPktSeg *seg = mpp_packet_get_segment_info(mpp_packet);
+    if (!segment_nb || !seg) return out;
+
+    out.reserve(segment_nb);
+    for (RK_U32 i = 0; i < segment_nb && seg; ++i, seg = seg->next) {
+        if (seg->offset > packet.len || seg->len > packet.len - seg->offset) {
+            out.clear();
+            return out;
+        }
+
+        const uint8_t *nal = packet.data + seg->offset;
+        size_t nal_size = seg->len;
+        strip_annexb_start_code(&nal, &nal_size);
+        while (nal_size > 0 && nal[nal_size - 1] == 0) --nal_size;
+        if (nal_size > 0) out.push_back({nal, nal_size});
+    }
+    return out;
+}
+
+std::vector<NalUnit> packet_nals(const EncodedPacket &packet) {
+    auto nals = nals_from_mpp_segments(packet);
+    if (!nals.empty()) return nals;
+    return parse_annexb(packet.data, packet.len);
 }
 
 std::string base64_encode(const uint8_t *data, size_t len) {
@@ -978,7 +1029,12 @@ public:
     }
 
     void write_frame(const uint8_t *data, size_t len) override {
-        auto nals = parse_annexb(data, len);
+        EncodedPacket packet{data, len, {}};
+        write_packet(packet);
+    }
+
+    void write_packet(const EncodedPacket &packet) override {
+        auto nals = packet_nals(packet);
         if (nals.empty()) return;
 
         size_t last_payload_nal = nals.size();
@@ -1426,7 +1482,8 @@ public:
             storage.size = storage.bytes->size();
         }
 
-        auto nals = parse_annexb(storage.data, storage.size);
+        EncodedPacket storage_packet{storage.data, storage.size, storage.packet};
+        auto nals = packet_nals(storage_packet);
         if (nals.empty()) return;
 
         size_t last_payload_nal = nals.size();

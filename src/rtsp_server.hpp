@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -71,6 +72,18 @@ public:
             listen_fd_ = -1;
         }
         if (accept_thread_.joinable()) accept_thread_.join();
+
+        std::vector<std::shared_ptr<Session>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            sessions = sessions_;
+        }
+        for (const auto &session : sessions) session->stop();
+        for (const auto &session : sessions) session->join();
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            sessions_.clear();
+        }
     }
 
     bool has_clients() const {
@@ -236,13 +249,25 @@ private:
         }
 
         ~Session() {
+            stop();
+            join();
+        }
+
+        void stop() {
+            closed_.store(true, std::memory_order_relaxed);
             close_socket();
+            queue_cv_.notify_all();
+        }
+
+        void join() {
+            join_thread(read_thread_);
+            join_thread(write_thread_);
         }
 
         void start() {
             auto self = shared_from_this();
-            std::thread([self] { self->read_loop(); }).detach();
-            std::thread([self] { self->write_loop(); }).detach();
+            read_thread_ = std::thread([self] { self->read_loop(); });
+            write_thread_ = std::thread([self] { self->write_loop(); });
         }
 
         bool closed() const { return closed_.load(std::memory_order_relaxed); }
@@ -252,19 +277,34 @@ private:
         void enqueue(const std::vector<RtpChunk> &chunks) {
             if (!playing() || closed()) return;
             std::lock_guard<std::mutex> lock(queue_mutex_);
+            std::vector<const RtpChunk *> accepted;
+            accepted.reserve(chunks.size());
+            size_t frame_bytes = 0;
             for (const auto &chunk : chunks) {
                 if (chunk.channel == 0 && !video_track_.setup) continue;
                 if (chunk.channel == 2 && !audio_track_.setup) continue;
                 size_t bytes = chunk.wire_size();
-                while (!queue_.empty() && queue_bytes_ + bytes > max_queue_bytes_) {
-                    queue_bytes_ -= queue_.front().wire_size();
-                    queue_.pop_front();
-                    ++dropped_;
-                    server_.queue_drops_.fetch_add(1, std::memory_order_relaxed);
-                }
                 if (bytes > max_queue_bytes_) continue;
-                queue_.push_back(chunk);
-                queue_bytes_ += bytes;
+                accepted.push_back(&chunk);
+                frame_bytes += bytes;
+            }
+            if (accepted.empty()) return;
+            if (frame_bytes > max_queue_bytes_) {
+                dropped_ += accepted.size();
+                server_.queue_drops_.fetch_add(accepted.size(), std::memory_order_relaxed);
+                return;
+            }
+            if (queue_bytes_ + frame_bytes > max_queue_bytes_) {
+                size_t dropped = queue_.size();
+                queue_.clear();
+                queue_bytes_ = 0;
+                dropped_ += dropped;
+                server_.queue_drops_.fetch_add(dropped, std::memory_order_relaxed);
+                trace("queue_clear", "client is not reading fast enough");
+            }
+            for (const auto *chunk : accepted) {
+                queue_.push_back(*chunk);
+                queue_bytes_ += chunk->wire_size();
             }
             queue_cv_.notify_one();
         }
@@ -280,6 +320,15 @@ private:
             Playing,
             Teardown,
         };
+
+        void join_thread(std::thread &thread) {
+            if (!thread.joinable()) return;
+            if (thread.get_id() == std::this_thread::get_id()) {
+                thread.detach();
+                return;
+            }
+            thread.join();
+        }
 
         struct TrackState {
             bool setup = false;
@@ -340,6 +389,7 @@ private:
             }
             bool was_playing = playing_.exchange(false, std::memory_order_relaxed);
             if (was_playing) server_.reader_stopped();
+            if (!closed()) send_rtcp_bye_for_setup_tracks();
             clear_queue();
             state_ = State::Teardown;
             if (server_.rtsp_debug_) {
@@ -532,15 +582,16 @@ private:
             }
 
             if (method == "OPTIONS") {
-                return send_response(cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER\r\n");
+                return send_response(cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n");
             }
-            if (method == "GET_PARAMETER") {
+            if (method == "GET_PARAMETER" || method == "SET_PARAMETER") {
                 if (!session_id_.empty() && !require_session(req, cseq)) return true;
                 std::string extra;
                 if (!session_id_.empty()) extra = session_header();
                 return send_response(cseq, extra);
             }
             if (method == "DESCRIBE") {
+                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
                 std::string sdp = server_.sdp();
                 std::ostringstream resp;
                 resp << "RTSP/1.0 200 OK\r\n"
@@ -552,6 +603,7 @@ private:
                 return send_raw(resp.str());
             }
             if (method == "SETUP") {
+                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
                 bool audio = url.find("trackID=1") != std::string::npos;
                 bool video = url.find("trackID=0") != std::string::npos;
                 if (!audio && !video) return send_error(cseq, 404, "Not Found");
@@ -588,6 +640,7 @@ private:
                 return send_response(cseq, extra.str());
             }
             if (method == "PLAY") {
+                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
                 if (!video_track_.setup && !audio_track_.setup) return send_error(cseq, 455, "Method Not Valid in This State");
                 if (!require_session(req, cseq)) return true;
                 bool was_playing = playing_.load(std::memory_order_relaxed);
@@ -643,6 +696,7 @@ private:
                 return true;
             }
             if (method == "PAUSE") {
+                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
                 if (!require_session(req, cseq)) return true;
                 if (playing_.exchange(false, std::memory_order_relaxed)) {
                     clear_queue();
@@ -653,6 +707,7 @@ private:
                 return send_response(cseq, session_header());
             }
             if (method == "TEARDOWN") {
+                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
                 if (!require_session(req, cseq)) return true;
                 clear_queue();
                 state_ = State::Teardown;
@@ -793,6 +848,11 @@ private:
             return send_rtcp_sender_report(track);
         }
 
+        void send_rtcp_bye_for_setup_tracks() {
+            if (video_track_.setup) (void)send_rtcp_bye(video_track_);
+            if (audio_track_.setup) (void)send_rtcp_bye(audio_track_);
+        }
+
         static void append_be32(std::vector<uint8_t> &dst, uint32_t value) {
             dst.push_back(static_cast<uint8_t>(value >> 24));
             dst.push_back(static_cast<uint8_t>(value >> 16));
@@ -838,6 +898,29 @@ private:
             rtcp[sdes_start + 3] = static_cast<uint8_t>(sdes_length);
 
             if (rtcp.size() > 0xffff) return false;
+
+            uint8_t interleaved[4] = {
+                '$',
+                track.rtcp_channel,
+                static_cast<uint8_t>(rtcp.size() >> 8),
+                static_cast<uint8_t>(rtcp.size()),
+            };
+            iovec iov[2] = {
+                {interleaved, sizeof(interleaved)},
+                {rtcp.data(), rtcp.size()},
+            };
+            std::lock_guard<std::mutex> lock(send_mutex_);
+            return send_iov_locked(iov, 2);
+        }
+
+        bool send_rtcp_bye(const TrackState &track) {
+            std::vector<uint8_t> rtcp;
+            rtcp.reserve(12);
+            rtcp.push_back(0x81); // V=2, P=0, SC=1.
+            rtcp.push_back(203);  // BYE.
+            rtcp.push_back(0);
+            rtcp.push_back(1);    // 8 bytes / 4 - 1.
+            append_be32(rtcp, track.ssrc);
 
             uint8_t interleaved[4] = {
                 '$',
@@ -901,6 +984,8 @@ private:
         std::deque<RtpChunk> queue_;
         size_t queue_bytes_ = 0;
         uint64_t dropped_ = 0;
+        std::thread read_thread_;
+        std::thread write_thread_;
     };
 
     void extract_sps_pps(const std::vector<uint8_t> &header) {
@@ -1140,6 +1225,29 @@ private:
         if (track != std::string::npos) return url.substr(0, track + 1);
         if (!url.empty() && url.back() == '/') return url;
         return url + "/";
+    }
+
+    static std::string path_from_rtsp_url(const std::string &url) {
+        if (url == "*") return url;
+        size_t path_pos = 0;
+        size_t scheme = url.find("://");
+        if (scheme != std::string::npos) {
+            path_pos = url.find('/', scheme + 3);
+            if (path_pos == std::string::npos) return "/";
+        }
+        std::string path = url.substr(path_pos);
+        size_t query = path.find('?');
+        if (query != std::string::npos) path.resize(query);
+        if (path.empty()) return "/";
+        return path;
+    }
+
+    bool url_matches_stream(const std::string &url) const {
+        std::string path = path_from_rtsp_url(url);
+        if (path == path_) return true;
+        if (path == path_ + "/") return true;
+        std::string track_prefix = (path_ == "/") ? "/trackID=" : path_ + "/trackID=";
+        return path.rfind(track_prefix, 0) == 0;
     }
 
     std::string response_common_headers(const std::string &cseq) const {

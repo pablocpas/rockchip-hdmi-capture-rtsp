@@ -85,6 +85,16 @@ bool starts_with(const std::string &s, const std::string &prefix) {
     return s.rfind(prefix, 0) == 0;
 }
 
+bool env_truthy(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !*value) return false;
+    std::string v(value);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(tolower(c));
+    });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
 [[noreturn]] void die(const std::string &msg) {
     throw std::runtime_error(msg);
 }
@@ -200,6 +210,8 @@ Options parse_args(int argc, char **argv) {
             die("unknown argument: " + arg);
         }
     }
+
+    if (env_truthy("RTSP_DEBUG")) opt.rtsp_debug = true;
 
     if (!opt.stream_profile.empty()) {
         if (opt.stream_profile == "default" || opt.stream_profile == "recommended") {

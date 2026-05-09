@@ -230,6 +230,7 @@ private:
             : server_(server), fd_(fd), id_(id) {
             int yes = 1;
             setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+            cname_ = "rk-hdmi-streamer-" + std::to_string(id_);
             reset_track_for_new_epoch(video_track_, 0, 1);
             reset_track_for_new_epoch(audio_track_, 2, 3);
         }
@@ -291,6 +292,7 @@ private:
             uint32_t packet_count = 0;
             uint32_t octet_count = 0;
             uint32_t rtcp_rx_count = 0;
+            std::string cname;
             std::chrono::steady_clock::time_point last_rtcp = std::chrono::steady_clock::time_point::min();
         };
 
@@ -304,6 +306,7 @@ private:
             track.packet_count = 0;
             track.octet_count = 0;
             track.rtcp_rx_count = 0;
+            track.cname = cname_;
             track.last_rtcp = std::chrono::steady_clock::time_point::min();
         }
 
@@ -522,6 +525,11 @@ private:
             is >> method >> url >> version;
             std::string cseq = header_value(req, "CSeq");
             if (cseq.empty()) cseq = "1";
+            if (server_.rtsp_debug_) {
+                std::string sess = session_token(header_value(req, "Session"));
+                trace("REQ", method + " " + url + " cseq=" + cseq +
+                             (sess.empty() ? "" : " session=" + sess));
+            }
 
             if (method == "OPTIONS") {
                 return send_response(cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER\r\n");
@@ -571,7 +579,12 @@ private:
                 extra << "Transport: RTP/AVP/TCP;unicast;interleaved="
                       << static_cast<int>(rtp_ch) << "-" << static_cast<int>(rtcp_ch) << "\r\n"
                       << session_header();
-                trace("SETUP", audio ? "audio" : "video");
+                std::ostringstream detail;
+                detail << (audio ? "audio" : "video")
+                       << " rtp_channel=" << static_cast<int>(rtp_ch)
+                       << " rtcp_channel=" << static_cast<int>(rtcp_ch)
+                       << " session=" << session_id_;
+                trace("SETUP", detail.str());
                 return send_response(cseq, extra.str());
             }
             if (method == "PLAY") {
@@ -615,9 +628,17 @@ private:
                     state_ = State::Playing;
                     playing_.store(true, std::memory_order_relaxed);
                     server_.commit_reader_start();
-                    trace("PLAY", std::string("tracks=") +
-                                  (video_track_.setup ? "video" : "") +
-                                  (video_track_.setup && audio_track_.setup ? ",audio" : audio_track_.setup ? "audio" : ""));
+                    std::ostringstream detail;
+                    detail << "tracks="
+                           << (video_track_.setup ? "video" : "")
+                           << (video_track_.setup && audio_track_.setup ? ",audio" : audio_track_.setup ? "audio" : "")
+                           << " video_seq=" << video_track_.seq
+                           << " video_rtptime=" << (video_track_.timestamp_base + server_.video_timestamp());
+                    if (audio_track_.setup) {
+                        detail << " audio_seq=" << audio_track_.seq
+                               << " audio_rtptime=" << (audio_track_.timestamp_base + server_.audio_timestamp());
+                    }
+                    trace("PLAY", detail.str());
                 }
                 return true;
             }
@@ -762,13 +783,6 @@ private:
             return send_rtcp_if_due(track);
         }
 
-        static void write_be32(uint8_t *dst, uint32_t value) {
-            dst[0] = static_cast<uint8_t>(value >> 24);
-            dst[1] = static_cast<uint8_t>(value >> 16);
-            dst[2] = static_cast<uint8_t>(value >> 8);
-            dst[3] = static_cast<uint8_t>(value);
-        }
-
         bool send_rtcp_if_due(TrackState &track) {
             auto now = std::chrono::steady_clock::now();
             if (track.last_rtcp != std::chrono::steady_clock::time_point::min() &&
@@ -779,6 +793,13 @@ private:
             return send_rtcp_sender_report(track);
         }
 
+        static void append_be32(std::vector<uint8_t> &dst, uint32_t value) {
+            dst.push_back(static_cast<uint8_t>(value >> 24));
+            dst.push_back(static_cast<uint8_t>(value >> 16));
+            dst.push_back(static_cast<uint8_t>(value >> 8));
+            dst.push_back(static_cast<uint8_t>(value));
+        }
+
         bool send_rtcp_sender_report(const TrackState &track) {
             timeval tv{};
             gettimeofday(&tv, nullptr);
@@ -786,27 +807,47 @@ private:
             uint32_t ntp_frac = static_cast<uint32_t>(
                 (static_cast<uint64_t>(tv.tv_usec) << 32) / 1000000ULL);
 
-            uint8_t rtcp[28] = {};
-            rtcp[0] = 0x80; // V=2, P=0, RC=0.
-            rtcp[1] = 200;  // Sender Report.
-            rtcp[2] = 0;
-            rtcp[3] = 6;    // 28 bytes / 4 - 1.
-            write_be32(rtcp + 4, track.ssrc);
-            write_be32(rtcp + 8, ntp_sec);
-            write_be32(rtcp + 12, ntp_frac);
-            write_be32(rtcp + 16, track.last_rtp_timestamp);
-            write_be32(rtcp + 20, track.packet_count);
-            write_be32(rtcp + 24, track.octet_count);
+            std::vector<uint8_t> rtcp;
+            rtcp.reserve(96);
+            rtcp.push_back(0x80); // V=2, P=0, RC=0.
+            rtcp.push_back(200);  // Sender Report.
+            rtcp.push_back(0);
+            rtcp.push_back(6);    // 28 bytes / 4 - 1.
+            append_be32(rtcp, track.ssrc);
+            append_be32(rtcp, ntp_sec);
+            append_be32(rtcp, ntp_frac);
+            append_be32(rtcp, track.last_rtp_timestamp);
+            append_be32(rtcp, track.packet_count);
+            append_be32(rtcp, track.octet_count);
+
+            std::string cname = track.cname;
+            if (cname.size() > 255) cname.resize(255);
+            size_t sdes_start = rtcp.size();
+            rtcp.push_back(0x81); // V=2, P=0, SC=1.
+            rtcp.push_back(202);  // SDES.
+            rtcp.push_back(0);
+            rtcp.push_back(0);    // Filled after padding.
+            append_be32(rtcp, track.ssrc);
+            rtcp.push_back(1);    // CNAME.
+            rtcp.push_back(static_cast<uint8_t>(cname.size()));
+            rtcp.insert(rtcp.end(), cname.begin(), cname.end());
+            rtcp.push_back(0);    // END.
+            while ((rtcp.size() - sdes_start) % 4 != 0) rtcp.push_back(0);
+            uint16_t sdes_length = static_cast<uint16_t>((rtcp.size() - sdes_start) / 4 - 1);
+            rtcp[sdes_start + 2] = static_cast<uint8_t>(sdes_length >> 8);
+            rtcp[sdes_start + 3] = static_cast<uint8_t>(sdes_length);
+
+            if (rtcp.size() > 0xffff) return false;
 
             uint8_t interleaved[4] = {
                 '$',
                 track.rtcp_channel,
-                0,
-                static_cast<uint8_t>(sizeof(rtcp)),
+                static_cast<uint8_t>(rtcp.size() >> 8),
+                static_cast<uint8_t>(rtcp.size()),
             };
             iovec iov[2] = {
                 {interleaved, sizeof(interleaved)},
-                {rtcp, sizeof(rtcp)},
+                {rtcp.data(), rtcp.size()},
             };
             std::lock_guard<std::mutex> lock(send_mutex_);
             return send_iov_locked(iov, 2);
@@ -851,6 +892,7 @@ private:
         State state_ = State::Init;
         TrackState video_track_;
         TrackState audio_track_;
+        std::string cname_;
         std::string session_id_;
         std::chrono::steady_clock::time_point last_activity_ = std::chrono::steady_clock::now();
         std::mutex send_mutex_;
@@ -1068,6 +1110,9 @@ private:
             "s=rk-hdmi-streamer\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "t=0 0\r\n"
+            "a=type:broadcast\r\n"
+            "a=control:*\r\n"
+            "a=range:npt=now-\r\n"
             "m=video 0 RTP/AVP 96\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile) +

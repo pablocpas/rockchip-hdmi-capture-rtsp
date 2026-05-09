@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.2.0
+
+- Added interactive `scripts/configure.sh` for plug-and-play setup and service
+  restart after configuration changes.
+- Added `scripts/doctor.sh` to diagnose MacroSilicon V4L2 capture devices, ALSA
+  audio, requested modes, RGA availability, RTSP port state, and systemd status.
+- Added clearer MS2131/MS2109 guidance, including RGA/YUYV as the recommended
+  performance path when available and MJPEG as the safest fallback.
+- Added optional Rockchip RGA runtime packaging support.
+- Added `mjpeg`, `rga`, and `yuyv-libyuv` stream profiles.
+- Improved direct RTSP debug logging.
+- Improved RTCP sender reports with compound `SR + SDES` packets and shared
+  CNAME per RTSP session.
+- Optimized direct RTSP packetization and packet lifetime handling.
+- Added notes for VLC Android audio output issues.
+
 ## v0.1.0
 
 Initial public release.

@@ -7,13 +7,14 @@ encodes H.264 with Rockchip MPP, captures ALSA audio, and serves the result as
 RTSP/TCP. It is designed for small ARM boards where using FFmpeg plus a relay
 server can waste too much CPU.
 
-Tested on a NanoPi R3S LTS with RK3568 and a MacroSilicon MS2131-style USB3 UVC
-HDMI capture dongle. The recommended TV/European cadence configuration is
-1080p50.
+Tested on a NanoPi R3S LTS with RK3568 and MacroSilicon MS2131/MS2109-style UVC
+HDMI capture dongles. The safest default profile is MJPEG; the recommended
+best-performance profile is RGA/YUYV when the capture dongle exposes the desired
+YUYV mode and Rockchip RGA is installed.
 
 ## Features
 
-- 1080p50 MJPEG capture from V4L2/UVC.
+- 1080p/720p MJPEG capture from V4L2/UVC, depending on the dongle mode table.
 - Optional YUYV/YUY2 capture path with `libyuv` or Rockchip RGA conversion.
 - Rockchip MPP JPEG decode and H.264 encode.
 - Optional V4L2 `DMABUF` capture into MPP/DRM buffers with `--v4l2-dmabuf`.
@@ -26,8 +27,8 @@ HDMI capture dongle. The recommended TV/European cadence configuration is
 ## Current Limitations
 
 - The default capture path targets UVC MJPEG input because it works on the
-  widest range of dongles. On Rockchip systems with working RGA, YUYV/YUY2 can
-  use a lower-CPU DMA-BUF path.
+  widest range of dongles. On Rockchip systems with working RGA, YUYV/YUY2 is
+  the recommended lower-CPU DMA-BUF path when the mode exists.
 - RTSP serving is TCP interleaved only. This is intentional for stability over
   tunnels such as WireGuard.
 - The direct server is designed for a few viewers, not large fan-out streaming.
@@ -39,6 +40,24 @@ HDMI capture dongle. The recommended TV/European cadence configuration is
 - Rockchip board with MPP support, for example RK3568/RK3588-class boards.
 - UVC HDMI capture dongle that exposes MJPEG at the target resolution/FPS.
 - USB bandwidth for the selected capture mode.
+
+## Known Tested Setup
+
+This project has been tested most heavily with:
+
+- Board: NanoPi R3S LTS, RK3568.
+- Capture devices: MacroSilicon MS2131-style USB3 HDMI capture and
+  MS2109-style HDMI capture.
+- Best MS2131 modes seen: `1920x1080@60` and `1920x1080@50` in both `MJPG`
+  and `YUYV`.
+- MS2109-style behavior seen: no `YUYV 1920x1080@50`; use MJPEG modes such as
+  `1920x1080@30` or `1280x720@50` depending on what the device advertises.
+- Safest first profile: `mjpeg`.
+- Recommended performance profile: `rga` when `YUYV` is available for the mode
+  you want and `librga.so` is installed.
+- For European TV sources, 50 fps preserves motion cadence better than 30 fps.
+  For cameras, consoles, desktop capture, or other sources, choose the FPS that
+  matches the source and the advertised V4L2 mode.
 
 ## Installation
 
@@ -59,8 +78,9 @@ sudo apt install -y \
 You also need Rockchip MPP runtime libraries from your board vendor image or
 packages. Package names vary; on some images they are included by default.
 
-Rockchip RGA is optional. The binary can run without `librga.so` unless you set
-`STREAM_PROFILE=rga` or pass `--stream-profile rga`.
+Rockchip RGA is optional but recommended for the lowest CPU path when the dongle
+advertises a matching YUYV mode. The binary can run without `librga.so` unless
+you set `STREAM_PROFILE=rga` or pass `--stream-profile rga`.
 
 ### Install From Release Binary
 
@@ -80,6 +100,18 @@ sudo install -m 644 systemd/rk-hdmi-streamer-direct.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rk-hdmi-streamer.service
 ```
+
+For a more plug-and-play setup, run the interactive configurator before
+starting the service:
+
+```bash
+sudo scripts/configure.sh
+scripts/doctor.sh
+```
+
+The configurator can also be rerun later to change mode, profile, FPS, bitrate,
+audio device, or RTSP path. When it writes `/etc/default/rk-hdmi-streamer`, it
+offers to restart `rk-hdmi-streamer.service` immediately.
 
 The release binary is dynamically linked and built for Linux `aarch64`. It still
 requires compatible runtime libraries on the target Rockchip system.
@@ -243,9 +275,51 @@ useful because it requires much more USB bandwidth and needs an extra format
 conversion before hardware H.264 encoding. On Rockchip, that conversion can be
 done with `libyuv` on CPU or with RGA.
 
+## Plug-And-Play Configuration
+
+For MacroSilicon HDMI capture dongles, the easiest flow is:
+
+```bash
+sudo scripts/configure.sh
+scripts/doctor.sh
+```
+
+`scripts/configure.sh` detects common MacroSilicon V4L2 nodes, asks which video
+and audio devices to use, writes `/etc/default/rk-hdmi-streamer`, and can
+restart the systemd service after applying changes. It offers profiles by goal:
+
+| Profile | Best for | Notes |
+| --- | --- | --- |
+| Auto | First-time setup and safe changes | Keeps the current resolution/FPS when possible, prefers RGA/YUYV when `librga.so` is available, otherwise MJPEG |
+| Best performance | Rockchip boards with RGA | Chooses the best common YUYV mode for `STREAM_PROFILE=rga` |
+| Most compatible | Any supported MacroSilicon dongle | Chooses the best common MJPEG mode |
+| TV cadence | European TV/set-top boxes | Prefers 1080p50, then 720p50, then 1080p30 |
+| Custom | Manual tuning | For unusual capture cards, FPS, bitrate, or paths |
+
+`scripts/doctor.sh` checks the installed config, V4L2 formats, ALSA capture
+device, RTSP port, and service state. It does not modify the system.
+
+### MacroSilicon MS2131 vs MS2109
+
+MacroSilicon model names are often hidden behind generic USB names such as
+`USB3 Video` or `MACROSILICON USB Video`, so the advertised V4L2 modes matter
+more than the name printed on the case.
+
+Known behavior from testing:
+
+| Device class | Typical high-FPS support | Recommended profile |
+| --- | --- | --- |
+| MS2131 / USB3 | `MJPG` and often `YUYV` at 1080p50/60 | Prefer `rga` when RGA is installed; `mjpeg` is the safe fallback |
+| MS2109 / USB2 | Often no `YUYV 1920x1080@50`; 1080p may be limited to lower FPS | Use `mjpeg` at the best advertised mode |
+
+For watching European TV sources, 50 fps usually preserves motion cadence better
+than 30 fps. If the dongle cannot expose 1080p50, `1280x720@50` can look more
+natural for motion than `1920x1080@30`. For other use cases, match the capture
+FPS to the HDMI source and the V4L2 mode table rather than forcing 50 fps.
+
 ## Direct RTSP Server
 
-Recommended mode:
+Compatible MJPEG mode:
 
 ```bash
 rk-hdmi-streamer \
@@ -270,8 +344,8 @@ The supported profiles are:
 
 | Profile | Pipeline | Use when |
 | --- | --- | --- |
+| `rga` | UVC YUYV DMA-BUF -> RGA NV12 -> MPP H.264 | Recommended lowest-CPU path when YUYV and RGA work |
 | `mjpeg` | UVC MJPEG -> MPP JPEG -> MPP H.264 | Default and most compatible |
-| `rga` | UVC YUYV DMA-BUF -> RGA NV12 -> MPP H.264 | Lowest CPU on Rockchip systems with working RGA |
 | `yuyv-libyuv` | UVC YUYV -> libyuv NV12 -> MPP H.264 | Debug/fallback when RGA is unavailable |
 
 To use the Rockchip RGA path:
@@ -515,6 +589,10 @@ If audio is missing:
 - Increase `--audio-gain` if the source is quiet.
 - Use `--audio-frame-ms 20` for the normal Opus RTP frame size; valid values
   are `2.5`, `5`, `10`, `20`, `40`, and `60`.
+- On VLC for Android, if audio works the first time but not after reopening the
+  same RTSP stream, change VLC's advanced audio output from `AudioTrack` to
+  `OpenSL ES`. This points to the client audio backend rather than missing RTP
+  audio from the server.
 
 If the service does not start:
 

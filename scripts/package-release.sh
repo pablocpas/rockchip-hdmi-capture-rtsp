@@ -29,6 +29,8 @@ install -m 644 "$ROOT/systemd/rk-hdmi-streamer.service" "$STAGE/systemd/rk-hdmi-
 install -m 644 "$ROOT/systemd/mediamtx.service" "$STAGE/systemd/mediamtx.service"
 install -m 755 "$ROOT/scripts/run-on-demand.sh" "$STAGE/scripts/run-on-demand.sh"
 install -m 755 "$ROOT/scripts/enable-on-demand.sh" "$STAGE/scripts/enable-on-demand.sh"
+install -m 755 "$ROOT/scripts/doctor.sh" "$STAGE/scripts/doctor.sh"
+install -m 755 "$ROOT/scripts/configure.sh" "$STAGE/scripts/configure.sh"
 
 if [ -n "${RGA_ROOT:-}" ] && [ -f "$RGA_ROOT/libs/Linux/gcc-aarch64/librga.so" ]; then
   mkdir -p "$STAGE/third_party/librga/aarch64"

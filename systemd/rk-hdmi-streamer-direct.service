@@ -6,9 +6,6 @@ Conflicts=mediamtx.service
 
 [Service]
 Type=simple
-User=pi
-Group=pi
-SupplementaryGroups=video audio render
 EnvironmentFile=-/etc/default/rk-hdmi-streamer
 Environment=DEVICE=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
 Environment=AUDIO_DEVICE=hw:CARD=Video,DEV=0

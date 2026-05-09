@@ -295,6 +295,7 @@ write_config() {
 
 DEVICE=$DEVICE
 AUDIO_DEVICE=$AUDIO_DEVICE
+VIDEO_CODEC=$VIDEO_CODEC
 AUDIO_CODEC=$AUDIO_CODEC
 AUDIO_GAIN=$AUDIO_GAIN
 AUDIO_FRAME_MS=$AUDIO_FRAME_MS
@@ -368,6 +369,7 @@ AUDIO_CODEC="${AUDIO_CODEC:-opus}"
 AUDIO_GAIN="${AUDIO_GAIN:-3.0}"
 AUDIO_FRAME_MS="${AUDIO_FRAME_MS:-20}"
 STREAM_PROFILE="${STREAM_PROFILE:-mjpeg}"
+VIDEO_CODEC="${VIDEO_CODEC:-h264}"
 WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
 FPS="${FPS:-30}"
@@ -429,6 +431,14 @@ if [ "$STREAM_PROFILE" = "mjpeg" ] && ! device_supports_mode "$DEVICE" MJPG "$WI
 fi
 
 AUDIO_CODEC="$(ask "Audio codec" "$AUDIO_CODEC")"
+VIDEO_CODEC="$(ask "Video codec" "$VIDEO_CODEC")"
+if [ "$VIDEO_CODEC" = "hevc" ]; then
+  VIDEO_CODEC=h265
+fi
+case "$VIDEO_CODEC" in
+  h264|h265) ;;
+  *) say "Invalid video codec: $VIDEO_CODEC. Use h264 or h265."; exit 1 ;;
+esac
 AUDIO_GAIN="$(ask "Audio gain" "$AUDIO_GAIN")"
 AUDIO_FRAME_MS="$(ask "Audio frame ms" "$AUDIO_FRAME_MS")"
 MAX_CLIENTS="$(ask "Max RTSP clients" "$MAX_CLIENTS")"
@@ -439,6 +449,7 @@ say
 say "Configuration summary:"
 say "  DEVICE=$DEVICE"
 say "  AUDIO_DEVICE=$AUDIO_DEVICE"
+say "  VIDEO_CODEC=$VIDEO_CODEC"
 say "  STREAM_PROFILE=$STREAM_PROFILE"
 [ -n "${RGA_LIBRARY:-}" ] && say "  RGA_LIBRARY=$RGA_LIBRARY"
 say "  WIDTH=$WIDTH HEIGHT=$HEIGHT FPS=$FPS BITRATE=$BITRATE GOP=$GOP"

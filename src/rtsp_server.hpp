@@ -41,7 +41,8 @@ class RtspServer : public MediaOutput {
 public:
     RtspServer(const std::string &listen_addr,
                const std::string &path,
-               const std::vector<uint8_t> &h264_header,
+               VideoCodec video_codec,
+               const std::vector<uint8_t> &video_header,
                int fps,
                bool audio,
                const std::string &audio_codec,
@@ -51,6 +52,7 @@ public:
                int max_clients)
         : listen_addr_(listen_addr),
           path_(path),
+          video_codec_(video_codec),
           fps_(fps),
           audio_enabled_(audio),
           audio_codec_(audio_codec),
@@ -58,7 +60,7 @@ public:
           audio_frame_frames_(audio_frame_frames),
           rtsp_debug_(rtsp_debug),
           max_clients_(max_clients) {
-        extract_sps_pps(h264_header);
+        extract_video_parameter_sets(video_header);
         listen_tcp();
         running_.store(true, std::memory_order_relaxed);
         accept_thread_ = std::thread([this] { accept_loop(); });
@@ -128,8 +130,7 @@ public:
 
         size_t last_payload_nal = nals.size();
         for (size_t i = nals.size(); i > 0; --i) {
-            uint8_t type = nals[i - 1].data[0] & 0x1f;
-            if (type != 9) {
+            if (!is_video_aud(nals[i - 1])) {
                 last_payload_nal = i - 1;
                 break;
             }
@@ -139,8 +140,7 @@ public:
         std::vector<RtpChunk> chunks;
         chunks.reserve(nals.size() + storage.size / max_payload_ + 1);
         for (size_t i = 0; i < nals.size(); ++i) {
-            uint8_t type = nals[i].data[0] & 0x1f;
-            if (type == 9) continue;
+            if (is_video_aud(nals[i])) continue;
             size_t offset = static_cast<size_t>(nals[i].data - storage.data);
             add_video_nal(chunks, storage, timestamp, offset, nals[i].size, i == last_payload_nal);
         }
@@ -230,7 +230,7 @@ private:
         RtpStorage storage;
         size_t offset = 0;
         size_t size = 0;
-        uint8_t prefix[2] = {};
+        uint8_t prefix[3] = {};
         size_t prefix_size = 0;
 
         size_t payload_size() const { return prefix_size + size; }
@@ -988,13 +988,36 @@ private:
         std::thread write_thread_;
     };
 
-    void extract_sps_pps(const std::vector<uint8_t> &header) {
+    uint8_t video_nal_type(const NalUnit &nal) const {
+        if (video_codec_ == VideoCodec::H264) return nal.data[0] & 0x1f;
+        if (nal.size < 2) return 0xff;
+        return (nal.data[0] >> 1) & 0x3f;
+    }
+
+    bool is_video_aud(const NalUnit &nal) const {
+        uint8_t type = video_nal_type(nal);
+        return video_codec_ == VideoCodec::H264 ? type == 9 : type == 35;
+    }
+
+    void extract_video_parameter_sets(const std::vector<uint8_t> &header) {
         for (const auto &nal : parse_annexb(header.data(), header.size())) {
-            uint8_t type = nal.data[0] & 0x1f;
-            if (type == 7) sps_.assign(nal.data, nal.data + nal.size);
-            if (type == 8) pps_.assign(nal.data, nal.data + nal.size);
+            uint8_t type = video_nal_type(nal);
+            if (video_codec_ == VideoCodec::H264) {
+                if (type == 7) sps_.assign(nal.data, nal.data + nal.size);
+                if (type == 8) pps_.assign(nal.data, nal.data + nal.size);
+            } else {
+                if (type == 32) vps_.assign(nal.data, nal.data + nal.size);
+                if (type == 33) sps_.assign(nal.data, nal.data + nal.size);
+                if (type == 34) pps_.assign(nal.data, nal.data + nal.size);
+            }
         }
-        if (sps_.size() < 4 || pps_.empty()) rtsp_die("H.264 header did not contain SPS/PPS");
+        if (video_codec_ == VideoCodec::H264) {
+            if (sps_.size() < 4 || pps_.empty()) rtsp_die("H.264 header did not contain SPS/PPS");
+        } else {
+            if (vps_.empty() || sps_.empty() || pps_.empty()) {
+                rtsp_die("H.265 header did not contain VPS/SPS/PPS");
+            }
+        }
     }
 
     void listen_tcp() {
@@ -1146,6 +1169,19 @@ private:
                        size_t offset,
                        size_t len,
                        bool marker) {
+        if (video_codec_ == VideoCodec::H265) {
+            add_h265_nal(chunks, storage, timestamp, offset, len, marker);
+            return;
+        }
+        add_h264_nal(chunks, storage, timestamp, offset, len, marker);
+    }
+
+    void add_h264_nal(std::vector<RtpChunk> &chunks,
+                      const RtpStorage &storage,
+                      uint32_t timestamp,
+                      size_t offset,
+                      size_t len,
+                      bool marker) {
         if (len <= max_payload_) {
             RtpChunk chunk{};
             chunk.channel = 0;
@@ -1186,9 +1222,57 @@ private:
         }
     }
 
+    void add_h265_nal(std::vector<RtpChunk> &chunks,
+                      const RtpStorage &storage,
+                      uint32_t timestamp,
+                      size_t offset,
+                      size_t len,
+                      bool marker) {
+        if (len <= max_payload_ || len < 3) {
+            RtpChunk chunk{};
+            chunk.channel = 0;
+            chunk.payload_type = 96;
+            chunk.timestamp = timestamp;
+            chunk.marker = marker;
+            chunk.storage = storage;
+            chunk.offset = offset;
+            chunk.size = len;
+            chunks.push_back(std::move(chunk));
+            return;
+        }
+
+        const uint8_t *nal = storage.data + offset;
+        uint8_t nal_type = (nal[0] >> 1) & 0x3f;
+        uint8_t payload_header[2] = {
+            static_cast<uint8_t>((nal[0] & 0x81) | (49 << 1)),
+            nal[1],
+        };
+        size_t pos = 2;
+        bool start = true;
+        while (pos < len) {
+            size_t chunk_len = std::min(max_payload_ - 3, len - pos);
+            bool end = (pos + chunk_len) >= len;
+            RtpChunk chunk{};
+            chunk.channel = 0;
+            chunk.payload_type = 96;
+            chunk.timestamp = timestamp;
+            chunk.marker = marker && end;
+            chunk.storage = storage;
+            chunk.offset = offset + pos;
+            chunk.size = chunk_len;
+            chunk.prefix[0] = payload_header[0];
+            chunk.prefix[1] = payload_header[1];
+            chunk.prefix[2] = static_cast<uint8_t>((start ? 0x80 : 0x00) |
+                                                   (end ? 0x40 : 0x00) |
+                                                   nal_type);
+            chunk.prefix_size = 3;
+            chunks.push_back(std::move(chunk));
+            pos += chunk_len;
+            start = false;
+        }
+    }
+
     std::string sdp() const {
-        char profile[7];
-        snprintf(profile, sizeof(profile), "%02x%02x%02x", sps_[1], sps_[2], sps_[3]);
         std::string s =
             "v=0\r\n"
             "o=- 0 0 IN IP4 0.0.0.0\r\n"
@@ -1198,12 +1282,12 @@ private:
             "a=type:broadcast\r\n"
             "a=control:*\r\n"
             "a=range:npt=now-\r\n"
-            "m=video 0 RTP/AVP 96\r\n"
-            "a=rtpmap:96 H264/90000\r\n"
-            "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile) +
-            ";sprop-parameter-sets=" + base64_encode(sps_.data(), sps_.size()) + "," +
-            base64_encode(pps_.data(), pps_.size()) + "\r\n"
-            "a=control:trackID=0\r\n";
+            "m=video 0 RTP/AVP 96\r\n";
+        if (video_codec_ == VideoCodec::H264) {
+            s += sdp_h264();
+        } else {
+            s += sdp_h265();
+        }
         if (audio_enabled_) {
             s += "m=audio 0 RTP/AVP 97\r\n";
             if (audio_codec_ == "opus") {
@@ -1218,6 +1302,26 @@ private:
             s += "a=control:trackID=1\r\n";
         }
         return s;
+    }
+
+    std::string sdp_h264() const {
+        char profile[7];
+        snprintf(profile, sizeof(profile), "%02x%02x%02x", sps_[1], sps_[2], sps_[3]);
+        return
+            "a=rtpmap:96 H264/90000\r\n"
+            "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile) +
+            ";sprop-parameter-sets=" + base64_encode(sps_.data(), sps_.size()) + "," +
+            base64_encode(pps_.data(), pps_.size()) + "\r\n"
+            "a=control:trackID=0\r\n";
+    }
+
+    std::string sdp_h265() const {
+        return
+            "a=rtpmap:96 H265/90000\r\n"
+            "a=fmtp:96 sprop-vps=" + base64_encode(vps_.data(), vps_.size()) +
+            ";sprop-sps=" + base64_encode(sps_.data(), sps_.size()) +
+            ";sprop-pps=" + base64_encode(pps_.data(), pps_.size()) + "\r\n"
+            "a=control:trackID=0\r\n";
     }
 
     std::string content_base(const std::string &url) const {
@@ -1275,6 +1379,7 @@ private:
 
     std::string listen_addr_;
     std::string path_;
+    VideoCodec video_codec_ = VideoCodec::H264;
     int fps_ = 30;
     bool audio_enabled_ = false;
     std::string audio_codec_;
@@ -1294,6 +1399,7 @@ private:
     std::condition_variable active_cv_;
     std::vector<uint8_t> sps_;
     std::vector<uint8_t> pps_;
+    std::vector<uint8_t> vps_;
     std::atomic<uint32_t> video_timestamp_{0};
     std::atomic<uint32_t> audio_timestamp_{0};
     std::atomic_bool audio_marker_{true};

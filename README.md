@@ -10,7 +10,8 @@ boards where a full FFmpeg plus relay-server pipeline wastes too much CPU.
 ## What It Supports
 
 - Direct RTSP/TCP interleaved server, no relay required.
-- H.264 video from Rockchip MPP encoder.
+- H.264 video from Rockchip MPP encoder by default.
+- Experimental H.265/HEVC video via `--video-codec h265` for lower bitrate tests.
 - MJPEG capture path: UVC MJPEG -> MPP JPEG -> MPP H.264.
 - RGA capture path: UVC YUYV -> RGA NV12 -> MPP H.264.
 - CPU fallback path: UVC YUYV -> libyuv NV12 -> MPP H.264.
@@ -142,6 +143,7 @@ Useful keys:
 ```bash
 DEVICE=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
 AUDIO_DEVICE=hw:CARD=Video,DEV=0
+VIDEO_CODEC=h264
 STREAM_PROFILE=mjpeg
 WIDTH=1920
 HEIGHT=1080

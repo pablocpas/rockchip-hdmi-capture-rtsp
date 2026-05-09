@@ -17,6 +17,11 @@ struct MppPacketDeleter {
 
 using SharedMppPacket = std::shared_ptr<std::remove_pointer<MppPacket>::type>;
 
+enum class VideoCodec {
+    H264,
+    H265,
+};
+
 struct EncodedPacket {
     const uint8_t *data = nullptr;
     size_t len = 0;

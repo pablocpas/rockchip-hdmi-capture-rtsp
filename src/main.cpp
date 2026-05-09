@@ -57,6 +57,7 @@ struct Options {
     std::string device = "/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0";
     std::string audio_device = "hw:CARD=Video,DEV=0";
     std::string audio_codec = "l16";
+    std::string video_codec = "h264";
     std::string output = "-";
     std::string stream_profile;
     std::string input_format = "mjpeg";
@@ -111,6 +112,7 @@ void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options]\n"
             "  --device PATH      V4L2 device (default /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0)\n"
+            "  --video-codec NAME h264 or h265/hevc (default h264)\n"
             "  --audio-device ID  ALSA capture device (default hw:CARD=Video,DEV=0)\n"
             "  --audio-codec NAME  l16 or opus, if built with libopus (default l16)\n"
             "  --audio-gain N     PCM gain before encoding (default 1.0)\n"
@@ -122,7 +124,7 @@ void usage(const char *argv0) {
             "  --yuyv-converter NAME libyuv or rga for YUYV input (default libyuv)\n"
             "  --rga-library PATH Override librga.so path for --yuyv-converter rga\n"
             "  --v4l2-dmabuf      Capture V4L2 MJPEG directly into MPP/DRM dma-buf buffers\n"
-            "  --output PATH      H.264 Annex-B output path or - for stdout (default -)\n"
+            "  --output PATH      Annex-B video output path or - for stdout (default -)\n"
             "  --listen-rtsp ADDR Listen as RTSP/TCP server, e.g. :8554 or 0.0.0.0:8554\n"
             "  --rtsp-path PATH   RTSP server path (default /capture)\n"
             "  --rtsp-debug       Log RTSP session state changes\n"
@@ -166,6 +168,7 @@ Options parse_args(int argc, char **argv) {
 
         std::string arg = argv[i];
         if (arg == "--device") opt.device = need_value("--device");
+        else if (arg == "--video-codec") opt.video_codec = need_value("--video-codec");
         else if (arg == "--audio-device") opt.audio_device = need_value("--audio-device");
         else if (arg == "--audio-codec") opt.audio_codec = need_value("--audio-codec");
         else if (arg == "--audio-gain") opt.audio_gain = atof(need_value("--audio-gain"));
@@ -281,6 +284,10 @@ Options parse_args(int argc, char **argv) {
     }
     if (opt.decoder != "mppjpeg" && opt.decoder != "turbojpeg") {
         die("--decoder must be mppjpeg or turbojpeg");
+    }
+    if (opt.video_codec == "hevc") opt.video_codec = "h265";
+    if (opt.video_codec != "h264" && opt.video_codec != "h265") {
+        die("--video-codec must be h264 or h265");
     }
     if (opt.audio_codec != "l16" && opt.audio_codec != "opus") {
         die("--audio-codec must be l16 or opus");
@@ -813,9 +820,9 @@ private:
     std::vector<MppBuffer> buffers_;
 };
 
-class MppH264Encoder {
+class MppVideoEncoder {
 public:
-    explicit MppH264Encoder(const Options &opt,
+    explicit MppVideoEncoder(const Options &opt,
                             int hor_stride,
                             int ver_stride,
                             MppFrameFormat fmt,
@@ -829,7 +836,7 @@ public:
         init();
     }
 
-    ~MppH264Encoder() {
+    ~MppVideoEncoder() {
         if (frame_buf_) mpp_buffer_put(frame_buf_);
         if (packet_buf_) mpp_buffer_put(packet_buf_);
         if (buf_grp_) mpp_buffer_group_put(buf_grp_);
@@ -983,6 +990,19 @@ private:
         return 42;
     }
 
+    static int h265_level_for(int width, int height, int fps) {
+        int pixels = width * height;
+        int samples_per_sec = pixels * fps;
+        if (pixels <= 1280 * 720 && samples_per_sec <= 1280 * 720 * 60) return 93;
+        if (pixels <= 1920 * 1080 && samples_per_sec <= 1920 * 1080 * 30) return 120;
+        if (pixels <= 1920 * 1080 && samples_per_sec <= 1920 * 1080 * 60) return 123;
+        return 150;
+    }
+
+    MppCodingType coding_type() const {
+        return opt_.video_codec == "h265" ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
+    }
+
     template <typename Writer>
     void submit_frame(MppFrame frame, Writer writer) {
         MPP_RET ret = mpi_->encode_put_frame(ctx_, frame);
@@ -1016,11 +1036,12 @@ private:
         MppPollType timeout = MPP_POLL_BLOCK;
         mpi_->control(ctx_, MPP_SET_OUTPUT_TIMEOUT, &timeout);
 
-        if (mpp_init(ctx_, MPP_CTX_ENC, MPP_VIDEO_CodingAVC)) die("mpp_init encoder failed");
+        MppCodingType coding = coding_type();
+        if (mpp_init(ctx_, MPP_CTX_ENC, coding)) die("mpp_init encoder failed");
         if (mpp_enc_cfg_init(&cfg_)) die("mpp_enc_cfg_init failed");
         if (mpi_->control(ctx_, MPP_ENC_GET_CFG, cfg_)) die("MPP_ENC_GET_CFG failed");
 
-        mpp_enc_cfg_set_s32(cfg_, "codec:type", MPP_VIDEO_CodingAVC);
+        mpp_enc_cfg_set_s32(cfg_, "codec:type", coding);
         mpp_enc_cfg_set_s32(cfg_, "prep:width", opt_.width);
         mpp_enc_cfg_set_s32(cfg_, "prep:height", opt_.height);
         mpp_enc_cfg_set_s32(cfg_, "prep:hor_stride", hor_stride_);
@@ -1051,11 +1072,17 @@ private:
         mpp_enc_cfg_set_s32(cfg_, "rc:qp_min_i", 10);
         mpp_enc_cfg_set_s32(cfg_, "rc:qp_ip", 2);
 
-        mpp_enc_cfg_set_s32(cfg_, "h264:profile", 100);
-        mpp_enc_cfg_set_s32(cfg_, "h264:level", h264_level_for(opt_.width, opt_.height, opt_.fps));
-        mpp_enc_cfg_set_s32(cfg_, "h264:cabac_en", 1);
-        mpp_enc_cfg_set_s32(cfg_, "h264:cabac_idc", 0);
-        mpp_enc_cfg_set_s32(cfg_, "h264:trans8x8", 1);
+        if (coding == MPP_VIDEO_CodingAVC) {
+            mpp_enc_cfg_set_s32(cfg_, "h264:profile", 100);
+            mpp_enc_cfg_set_s32(cfg_, "h264:level", h264_level_for(opt_.width, opt_.height, opt_.fps));
+            mpp_enc_cfg_set_s32(cfg_, "h264:cabac_en", 1);
+            mpp_enc_cfg_set_s32(cfg_, "h264:cabac_idc", 0);
+            mpp_enc_cfg_set_s32(cfg_, "h264:trans8x8", 1);
+        } else {
+            mpp_enc_cfg_set_s32(cfg_, "h265:profile", 1);
+            mpp_enc_cfg_set_s32(cfg_, "h265:level", h265_level_for(opt_.width, opt_.height, opt_.fps));
+            mpp_enc_cfg_set_s32(cfg_, "h265:diff_cu_qp_delta_depth", 0);
+        }
 
         if (mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg_)) die("MPP_ENC_SET_CFG failed");
 
@@ -1774,13 +1801,14 @@ int main(int argc, char **argv) {
     try {
         Options opt = parse_args(argc, argv);
 
-        // Keep logs off stdout so stdout can be a clean H.264 bytestream.
-        fprintf(stderr, "capture=%s %dx%d@%d %s, profile=%s, decoder=%s, yuyv_converter=%s, h264_mpp bitrate=%d output=%s\n",
+        // Keep logs off stdout so stdout can be a clean Annex-B bytestream.
+        fprintf(stderr, "capture=%s %dx%d@%d %s, profile=%s, decoder=%s, yuyv_converter=%s, %s_mpp bitrate=%d output=%s\n",
                 opt.device.c_str(), opt.width, opt.height, opt.fps,
                 input_format_label(opt.input_format),
                 opt.stream_profile.empty() ? "custom" : opt.stream_profile.c_str(),
                 opt.decoder.c_str(),
                 opt.yuyv_converter.c_str(),
+                opt.video_codec.c_str(),
                 opt.bitrate, opt.output.c_str());
 
         std::unique_ptr<TurboJpegDecoder> turbojpeg;
@@ -1816,7 +1844,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        MppH264Encoder enc(opt, enc_hor_stride, enc_ver_stride, enc_fmt, enc_alloc_input);
+        MppVideoEncoder enc(opt, enc_hor_stride, enc_ver_stride, enc_fmt, enc_alloc_input);
 
         std::unique_ptr<RgaYuyvToNv12Converter> yuyv_rga;
         if (opt.input_format == "yuyv" && opt.yuyv_converter == "rga") {
@@ -1835,9 +1863,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "YUYV converter: RGA dma-buf path enabled\n");
         }
 
-        std::vector<uint8_t> h264_header;
+        std::vector<uint8_t> video_header;
         enc.write_header([&](const uint8_t *data, size_t len) {
-            h264_header.insert(h264_header.end(), data, data + len);
+            video_header.insert(video_header.end(), data, data + len);
         });
 
         const bool serve_rtsp = !opt.listen_rtsp.empty();
@@ -1849,14 +1877,18 @@ int main(int argc, char **argv) {
         std::unique_ptr<AlsaAudioCapture> audio;
         AudioRuntime audio_runtime;
         if (serve_rtsp) {
-            rtsp_server = std::make_unique<RtspServer>(opt.listen_rtsp, opt.rtsp_path, h264_header,
+            VideoCodec codec = opt.video_codec == "h265" ? VideoCodec::H265 : VideoCodec::H264;
+            rtsp_server = std::make_unique<RtspServer>(opt.listen_rtsp, opt.rtsp_path, codec, video_header,
                                                        opt.fps, opt.audio, opt.audio_codec,
                                                        opt.rtp_payload_size, opt.audio_frame_frames,
                                                        opt.rtsp_debug,
                                                        opt.max_clients);
             media_output = rtsp_server.get();
         } else if (publish_rtsp) {
-            rtsp = std::make_unique<RtspPublisher>(opt.output, h264_header, opt.fps, opt.audio,
+            if (opt.video_codec != "h264") {
+                die("--output rtsp:// publisher mode currently supports only --video-codec h264");
+            }
+            rtsp = std::make_unique<RtspPublisher>(opt.output, video_header, opt.fps, opt.audio,
                                                    opt.audio_codec, opt.rtp_payload_size);
             media_output = rtsp.get();
             if (opt.audio) {
@@ -1869,9 +1901,9 @@ int main(int argc, char **argv) {
             }
         } else {
             out = std::make_unique<Output>(opt.output);
-            out->write(h264_header.data(), h264_header.size());
+            out->write(video_header.data(), video_header.size());
             if (opt.audio) {
-                fprintf(stderr, "audio ignored for raw H.264 output; use --output rtsp://... to publish audio\n");
+                fprintf(stderr, "audio ignored for raw video output; use --listen-rtsp to serve audio\n");
             }
         }
 

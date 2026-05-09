@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added experimental `--video-codec h265` direct RTSP support using Rockchip
+  MPP HEVC encoding and RTP/H.265 packetization.
+- Kept H.264 as the default video codec.
+
 ## v0.2.0
 
 - Added interactive `scripts/configure.sh` for plug-and-play setup and service

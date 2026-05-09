@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -37,29 +38,46 @@
 #include <opus/opus.h>
 #endif
 #include <turbojpeg.h>
+#ifdef HAVE_LIBYUV
+#include <libyuv/planar_functions.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
+#include "h264_utils.hpp"
+#include "media_types.hpp"
+#include "rga_converter.hpp"
+#include "rtsp_server.hpp"
 #include "rk_mpi.h"
 
 namespace {
 
 struct Options {
-    std::string device = "/dev/video0";
-    std::string audio_device = "hw:CARD=MS2109,DEV=0";
+    std::string device = "/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0";
+    std::string audio_device = "hw:CARD=Video,DEV=0";
     std::string audio_codec = "l16";
     std::string output = "-";
+    std::string stream_profile;
+    std::string input_format = "mjpeg";
+    std::string yuyv_converter = "libyuv";
+    std::string rga_library;
     std::string decoder = "mppjpeg";
     std::string listen_rtsp;
     std::string rtsp_path = "/capture";
     double audio_gain = 1.0;
+    size_t audio_frame_frames = 960; // 20 ms at 48 kHz.
     bool audio = true;
     bool v4l2_dmabuf = false;
-    int rtp_payload_size = 12000;
+    bool rtsp_debug = false;
+    int rtsp_idle_grace_ms = 3000;
+    int rtp_payload_size = 1400;
     int max_clients = 3;
     int width = 1920;
     int height = 1080;
-    int fps = 30;
-    int bitrate = 8000000;
-    int gop = 60;
+    int fps = 50;
+    int bitrate = 18000000;
+    int gop = 50;
     int frames = 0; // 0 means run forever.
 };
 
@@ -82,29 +100,51 @@ int xioctl(int fd, unsigned long request, void *arg) {
 void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options]\n"
-            "  --device PATH      V4L2 device (default /dev/video0)\n"
-            "  --audio-device ID  ALSA capture device (default hw:CARD=MS2109,DEV=0)\n"
+            "  --device PATH      V4L2 device (default /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0)\n"
+            "  --audio-device ID  ALSA capture device (default hw:CARD=Video,DEV=0)\n"
             "  --audio-codec NAME  l16 or opus, if built with libopus (default l16)\n"
             "  --audio-gain N     PCM gain before encoding (default 1.0)\n"
-            "  --rtp-payload N    Max RTP payload bytes (default 12000)\n"
+            "  --audio-frame-ms N Opus/ALSA audio frame duration: 2.5, 5, 10, 20, 40, or 60 (default 20)\n"
+            "  --rtp-payload N    Max RTP payload bytes (default 1400)\n"
             "  --no-audio         Disable RTSP audio track\n"
+            "  --stream-profile NAME mjpeg, rga, or yuyv-libyuv\n"
+            "  --input-format FMT mjpeg or yuyv/yuy2 (default mjpeg)\n"
+            "  --yuyv-converter NAME libyuv or rga for YUYV input (default libyuv)\n"
+            "  --rga-library PATH Override librga.so path for --yuyv-converter rga\n"
             "  --v4l2-dmabuf      Capture V4L2 MJPEG directly into MPP/DRM dma-buf buffers\n"
             "  --output PATH      H.264 Annex-B output path or - for stdout (default -)\n"
             "  --listen-rtsp ADDR Listen as RTSP/TCP server, e.g. :8554 or 0.0.0.0:8554\n"
             "  --rtsp-path PATH   RTSP server path (default /capture)\n"
+            "  --rtsp-debug       Log RTSP session state changes\n"
+            "  --rtsp-idle-grace-ms N  Keep capture running briefly after last RTSP client (default 3000)\n"
             "  --max-clients N    Maximum RTSP server clients (default 3)\n"
             "  --decoder NAME     mppjpeg or turbojpeg (default mppjpeg)\n"
             "  --width N          Capture width (default 1920)\n"
             "  --height N         Capture height (default 1080)\n"
-            "  --fps N            Capture/encode FPS (default 30)\n"
-            "  --bitrate N        Target bitrate in bit/s (default 8000000)\n"
-            "  --gop N            GOP length in frames (default 60)\n"
+            "  --fps N            Capture/encode FPS (default 50)\n"
+            "  --bitrate N        Target bitrate in bit/s (default 18000000)\n"
+            "  --gop N            GOP length in frames (default 50)\n"
             "  --frames N         Stop after N frames (default 0 = forever)\n",
             argv0);
 }
 
+size_t parse_audio_frame_ms(const char *value) {
+    std::string s(value);
+    if (s == "2.5") return 120;
+    if (s == "5") return 240;
+    if (s == "10") return 480;
+    if (s == "20") return 960;
+    if (s == "40") return 1920;
+    if (s == "60") return 2880;
+    die("--audio-frame-ms must be one of: 2.5, 5, 10, 20, 40, 60");
+}
+
 Options parse_args(int argc, char **argv) {
     Options opt;
+    bool input_format_set = false;
+    bool yuyv_converter_set = false;
+    bool decoder_set = false;
+    bool v4l2_dmabuf_set = false;
     for (int i = 1; i < argc; ++i) {
         auto need_value = [&](const char *name) -> const char * {
             if (i + 1 >= argc) {
@@ -119,14 +159,33 @@ Options parse_args(int argc, char **argv) {
         else if (arg == "--audio-device") opt.audio_device = need_value("--audio-device");
         else if (arg == "--audio-codec") opt.audio_codec = need_value("--audio-codec");
         else if (arg == "--audio-gain") opt.audio_gain = atof(need_value("--audio-gain"));
+        else if (arg == "--audio-frame-ms") opt.audio_frame_frames = parse_audio_frame_ms(need_value("--audio-frame-ms"));
         else if (arg == "--rtp-payload") opt.rtp_payload_size = atoi(need_value("--rtp-payload"));
+        else if (arg == "--stream-profile") opt.stream_profile = need_value("--stream-profile");
+        else if (arg == "--input-format") {
+            opt.input_format = need_value("--input-format");
+            input_format_set = true;
+        }
+        else if (arg == "--yuyv-converter") {
+            opt.yuyv_converter = need_value("--yuyv-converter");
+            yuyv_converter_set = true;
+        }
+        else if (arg == "--rga-library") opt.rga_library = need_value("--rga-library");
         else if (arg == "--no-audio") opt.audio = false;
-        else if (arg == "--v4l2-dmabuf") opt.v4l2_dmabuf = true;
+        else if (arg == "--v4l2-dmabuf") {
+            opt.v4l2_dmabuf = true;
+            v4l2_dmabuf_set = true;
+        }
         else if (arg == "--output") opt.output = need_value("--output");
         else if (arg == "--listen-rtsp") opt.listen_rtsp = need_value("--listen-rtsp");
         else if (arg == "--rtsp-path") opt.rtsp_path = need_value("--rtsp-path");
+        else if (arg == "--rtsp-debug") opt.rtsp_debug = true;
+        else if (arg == "--rtsp-idle-grace-ms") opt.rtsp_idle_grace_ms = atoi(need_value("--rtsp-idle-grace-ms"));
         else if (arg == "--max-clients") opt.max_clients = atoi(need_value("--max-clients"));
-        else if (arg == "--decoder") opt.decoder = need_value("--decoder");
+        else if (arg == "--decoder") {
+            opt.decoder = need_value("--decoder");
+            decoder_set = true;
+        }
         else if (arg == "--width") opt.width = atoi(need_value("--width"));
         else if (arg == "--height") opt.height = atoi(need_value("--height"));
         else if (arg == "--fps") opt.fps = atoi(need_value("--fps"));
@@ -142,6 +201,32 @@ Options parse_args(int argc, char **argv) {
         }
     }
 
+    if (!opt.stream_profile.empty()) {
+        if (opt.stream_profile == "default" || opt.stream_profile == "recommended") {
+            opt.stream_profile = "mjpeg";
+        }
+
+        if (opt.stream_profile == "mjpeg") {
+            if (!input_format_set) opt.input_format = "mjpeg";
+            if (!yuyv_converter_set) opt.yuyv_converter = "libyuv";
+            if (!decoder_set) opt.decoder = "mppjpeg";
+            if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = true;
+        } else if (opt.stream_profile == "rga") {
+            if (!input_format_set) opt.input_format = "yuyv";
+            if (!yuyv_converter_set) opt.yuyv_converter = "rga";
+            if (!decoder_set) opt.decoder = "mppjpeg";
+            if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = true;
+        } else if (opt.stream_profile == "yuyv-libyuv" || opt.stream_profile == "libyuv") {
+            opt.stream_profile = "yuyv-libyuv";
+            if (!input_format_set) opt.input_format = "yuyv";
+            if (!yuyv_converter_set) opt.yuyv_converter = "libyuv";
+            if (!decoder_set) opt.decoder = "mppjpeg";
+            if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = false;
+        } else {
+            die("--stream-profile must be mjpeg, rga, or yuyv-libyuv");
+        }
+    }
+
     if (opt.width <= 0 || opt.height <= 0 || opt.fps <= 0 || opt.bitrate <= 0 || opt.gop <= 0) {
         die("invalid numeric option");
     }
@@ -154,8 +239,33 @@ Options parse_args(int argc, char **argv) {
     if (opt.max_clients <= 0 || opt.max_clients > 16) {
         die("--max-clients must be between 1 and 16");
     }
+    if (opt.rtsp_idle_grace_ms < 0 || opt.rtsp_idle_grace_ms > 60000) {
+        die("--rtsp-idle-grace-ms must be between 0 and 60000");
+    }
     if (!opt.rtsp_path.empty() && opt.rtsp_path[0] != '/') {
         opt.rtsp_path.insert(opt.rtsp_path.begin(), '/');
+    }
+    if (opt.input_format == "yuy2") opt.input_format = "yuyv";
+    if (opt.input_format != "mjpeg" && opt.input_format != "yuyv") {
+        die("--input-format must be mjpeg or yuyv");
+    }
+    if (opt.yuyv_converter != "libyuv" && opt.yuyv_converter != "rga") {
+        die("--yuyv-converter must be libyuv or rga");
+    }
+    if (opt.yuyv_converter == "rga" && opt.input_format != "yuyv") {
+        die("--yuyv-converter rga requires --input-format yuyv");
+    }
+#ifndef HAVE_RGA
+    if (opt.yuyv_converter == "rga") {
+        die("RGA YUYV converter requested but this binary was built without librga");
+    }
+#endif
+    if (opt.input_format == "yuyv" && opt.yuyv_converter == "rga") {
+        opt.v4l2_dmabuf = true;
+    } else if (opt.input_format != "mjpeg" && opt.v4l2_dmabuf) {
+        fprintf(stderr, "warning: --v4l2-dmabuf is only supported with MJPEG input; disabling it for %s\n",
+                opt.input_format.c_str());
+        opt.v4l2_dmabuf = false;
     }
     if (opt.decoder != "mppjpeg" && opt.decoder != "turbojpeg") {
         die("--decoder must be mppjpeg or turbojpeg");
@@ -178,14 +288,27 @@ struct MmapBuffer {
     MppBuffer mpp_buffer = nullptr;
 };
 
-struct CapturedMjpegFrame {
-    const uint8_t *data = nullptr;
-    size_t bytesused = 0;
-    size_t buffer_length = 0;
-    int dmabuf_fd = -1;
-    MppBuffer mpp_buffer = nullptr;
-    unsigned index = 0;
-};
+
+uint64_t monotonic_time_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+uint64_t timeval_to_ns(const timeval &tv) {
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) return monotonic_time_ns();
+    return static_cast<uint64_t>(tv.tv_sec) * 1000000000ULL + static_cast<uint64_t>(tv.tv_usec) * 1000ULL;
+}
+
+uint32_t v4l2_pixfmt_for_input(const std::string &input_format) {
+    if (input_format == "mjpeg") return V4L2_PIX_FMT_MJPEG;
+    if (input_format == "yuyv") return V4L2_PIX_FMT_YUYV;
+    die("unsupported input format");
+}
+
+const char *input_format_label(const std::string &input_format) {
+    return input_format == "yuyv" ? "YUYV" : "MJPEG";
+}
 
 class V4L2Capture {
 public:
@@ -216,14 +339,22 @@ public:
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = opt_.width;
         fmt.fmt.pix.height = opt_.height;
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        fmt.fmt.pix.pixelformat = v4l2_pixfmt_for_input(opt_.input_format);
         fmt.fmt.pix.field = V4L2_FIELD_NONE;
-        if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) die("VIDIOC_S_FMT MJPEG failed");
-        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) die("device did not accept MJPEG format");
+        if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
+            die(std::string("VIDIOC_S_FMT ") + input_format_label(opt_.input_format) + " failed");
+        }
+        if (fmt.fmt.pix.pixelformat != v4l2_pixfmt_for_input(opt_.input_format)) {
+            die(std::string("device did not accept ") + input_format_label(opt_.input_format) + " format");
+        }
         if ((int)fmt.fmt.pix.width != opt_.width || (int)fmt.fmt.pix.height != opt_.height) {
             die("device changed requested resolution");
         }
         buffer_size_ = fmt.fmt.pix.sizeimage;
+        bytesperline_ = fmt.fmt.pix.bytesperline;
+        if (bytesperline_ == 0 && opt_.input_format == "yuyv") {
+            bytesperline_ = static_cast<size_t>(opt_.width) * 2;
+        }
 
         v4l2_streamparm parm{};
         parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -233,6 +364,7 @@ public:
     }
 
     size_t buffer_size() const { return buffer_size_; }
+    size_t bytesperline() const { return bytesperline_; }
 
     void start(const std::vector<MppBuffer> *capture_buffers = nullptr) {
         if (streaming_) return;
@@ -327,10 +459,12 @@ public:
             }
         } else {
             const MmapBuffer &m = buffers_[buf.index];
-            CapturedMjpegFrame frame{};
+            CapturedFrame frame{};
             frame.data = static_cast<const uint8_t *>(m.start);
             frame.bytesused = buf.bytesused;
             frame.buffer_length = m.length;
+            frame.bytesperline = bytesperline_;
+            frame.timestamp_ns = timeval_to_ns(buf.timestamp);
             frame.dmabuf_fd = m.dmabuf_fd;
             frame.mpp_buffer = m.mpp_buffer;
             frame.index = buf.index;
@@ -345,6 +479,7 @@ private:
     int fd_ = -1;
     bool streaming_ = false;
     size_t buffer_size_ = 0;
+    size_t bytesperline_ = 0;
     uint64_t dropped_error_buffers_ = 0;
     std::vector<MmapBuffer> buffers_;
 };
@@ -391,7 +526,7 @@ public:
             memcpy(dst_u, u422_.data(), width_ * height_ / 4);
             memcpy(dst_v, v422_.data(), width_ * height_ / 4);
         } else if (subsamp == TJSAMP_422) {
-            // The MS2109 MJPEG stream is usually 4:2:2. Convert chroma to 4:2:0 by vertical averaging.
+            // MacroSilicon MJPEG streams are commonly 4:2:2. Convert chroma to 4:2:0 by vertical averaging.
             for (int y = 0; y < height_ / 2; ++y) {
                 const uint8_t *u0 = y422_plane_u(y * 2);
                 const uint8_t *u1 = y422_plane_u(y * 2 + 1);
@@ -478,7 +613,7 @@ public:
         return decode_packet(packet);
     }
 
-    MppFrame decode_to_frame(const CapturedMjpegFrame &captured) {
+    MppFrame decode_to_frame(const CapturedFrame &captured) {
         if (captured.mpp_buffer) {
             if (captured.bytesused < 4 || captured.bytesused > captured.buffer_length) {
                 return nullptr;
@@ -634,18 +769,36 @@ private:
     bool logged_layout_ = false;
 };
 
-struct MppPacketDeleter {
-    void operator()(MppPacket packet) const {
-        if (packet) mpp_packet_deinit(&packet);
+class MppDmabufPool {
+public:
+    MppDmabufPool(size_t buffer_size, size_t count) {
+        if (!buffer_size || !count) die("invalid dma-buf pool configuration");
+        if (mpp_buffer_group_get_internal(&grp_, MPP_BUFFER_TYPE_DRM)) {
+            die("dma-buf pool group init failed");
+        }
+        buffers_.resize(count, nullptr);
+        for (auto &buf : buffers_) {
+            if (mpp_buffer_get(grp_, &buf, buffer_size)) {
+                die("dma-buf pool allocation failed");
+            }
+            if (mpp_buffer_get_fd(buf) < 0) {
+                die("allocated buffer has no dma-buf fd");
+            }
+        }
     }
-};
 
-using SharedMppPacket = std::shared_ptr<std::remove_pointer<MppPacket>::type>;
+    ~MppDmabufPool() {
+        for (auto &buf : buffers_) {
+            if (buf) mpp_buffer_put(buf);
+        }
+        if (grp_) mpp_buffer_group_put(grp_);
+    }
 
-struct EncodedPacket {
-    const uint8_t *data = nullptr;
-    size_t len = 0;
-    SharedMppPacket mpp_packet;
+    const std::vector<MppBuffer> &buffers() const { return buffers_; }
+
+private:
+    MppBufferGroup grp_ = nullptr;
+    std::vector<MppBuffer> buffers_;
 };
 
 class MppH264Encoder {
@@ -672,6 +825,15 @@ public:
         if (ctx_) mpp_destroy(ctx_);
     }
 
+    int input_buffer_fd() const {
+        if (!frame_buf_) return -1;
+        return mpp_buffer_get_fd(frame_buf_);
+    }
+
+    size_t input_buffer_size() const {
+        return frame_size_;
+    }
+
     template <typename Writer>
     void write_header(Writer writer) {
         MppPacket hdr = nullptr;
@@ -695,6 +857,71 @@ public:
         mpp_frame_set_hor_stride(frame, hor_stride_);
         mpp_frame_set_ver_stride(frame, ver_stride_);
         mpp_frame_set_fmt(frame, MPP_FMT_YUV420P);
+        mpp_frame_set_buffer(frame, frame_buf_);
+
+        submit_frame(frame, writer);
+    }
+
+    template <typename Writer>
+    void encode_yuyv_as_nv12(const uint8_t *yuyv, size_t bytes, size_t bytesperline, Writer writer) {
+        const size_t min_size = static_cast<size_t>(opt_.width) * opt_.height * 2;
+        if (bytes < min_size) die("short YUYV frame");
+
+        auto *dst = static_cast<uint8_t *>(mpp_buffer_get_ptr(frame_buf_));
+        uint8_t *dst_y = dst;
+        uint8_t *dst_uv = dst_y + static_cast<size_t>(hor_stride_) * ver_stride_;
+        const size_t src_stride = bytesperline ? bytesperline : static_cast<size_t>(opt_.width) * 2;
+
+#ifdef HAVE_LIBYUV
+        int ret = libyuv::YUY2ToNV12(yuyv,
+                                     static_cast<int>(src_stride),
+                                     dst_y,
+                                     hor_stride_,
+                                     dst_uv,
+                                     hor_stride_,
+                                     opt_.width,
+                                     opt_.height);
+        if (ret) die("libyuv YUY2ToNV12 failed");
+        submit_nv12_frame(writer);
+        return;
+#endif
+
+        for (int y = 0; y < opt_.height; ++y) {
+            const uint8_t *src = yuyv + static_cast<size_t>(y) * src_stride;
+            uint8_t *dy = dst_y + static_cast<size_t>(y) * hor_stride_;
+            for (int x = 0; x < opt_.width; x += 2) {
+                const uint8_t *p = src + static_cast<size_t>(x) * 2;
+                dy[x] = p[0];
+                dy[x + 1] = p[2];
+            }
+        }
+
+        for (int y = 0; y < opt_.height; y += 2) {
+            const uint8_t *row0 = yuyv + static_cast<size_t>(y) * src_stride;
+            const uint8_t *row1 = y + 1 < opt_.height
+                ? yuyv + static_cast<size_t>(y + 1) * src_stride
+                : row0;
+            uint8_t *duv = dst_uv + static_cast<size_t>(y / 2) * hor_stride_;
+            for (int x = 0; x < opt_.width; x += 2) {
+                const uint8_t *p0 = row0 + static_cast<size_t>(x) * 2;
+                const uint8_t *p1 = row1 + static_cast<size_t>(x) * 2;
+                duv[x] = static_cast<uint8_t>((static_cast<unsigned>(p0[1]) + p1[1] + 1) / 2);
+                duv[x + 1] = static_cast<uint8_t>((static_cast<unsigned>(p0[3]) + p1[3] + 1) / 2);
+            }
+        }
+
+        submit_nv12_frame(writer);
+    }
+
+    template <typename Writer>
+    void submit_nv12_frame(Writer writer) {
+        MppFrame frame = nullptr;
+        if (mpp_frame_init(&frame)) die("mpp_frame_init failed");
+        mpp_frame_set_width(frame, opt_.width);
+        mpp_frame_set_height(frame, opt_.height);
+        mpp_frame_set_hor_stride(frame, hor_stride_);
+        mpp_frame_set_ver_stride(frame, ver_stride_);
+        mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
         mpp_frame_set_buffer(frame, frame_buf_);
 
         submit_frame(frame, writer);
@@ -730,6 +957,18 @@ private:
             default:
                 die("unsupported encoder input format");
         }
+    }
+
+    static int h264_level_for(int width, int height, int fps) {
+        int mb_width = (width + 15) / 16;
+        int mb_height = (height + 15) / 16;
+        int frame_mbs = mb_width * mb_height;
+        int mbps = frame_mbs * fps;
+
+        if (frame_mbs <= 3600 && mbps <= 108000) return 31;
+        if (frame_mbs <= 5120 && mbps <= 216000) return 32;
+        if (frame_mbs <= 8192 && mbps <= 245760) return 40;
+        return 42;
     }
 
     template <typename Writer>
@@ -801,7 +1040,7 @@ private:
         mpp_enc_cfg_set_s32(cfg_, "rc:qp_ip", 2);
 
         mpp_enc_cfg_set_s32(cfg_, "h264:profile", 100);
-        mpp_enc_cfg_set_s32(cfg_, "h264:level", opt_.height >= 1080 ? 40 : 31);
+        mpp_enc_cfg_set_s32(cfg_, "h264:level", h264_level_for(opt_.width, opt_.height, opt_.fps));
         mpp_enc_cfg_set_s32(cfg_, "h264:cabac_en", 1);
         mpp_enc_cfg_set_s32(cfg_, "h264:cabac_idc", 0);
         mpp_enc_cfg_set_s32(cfg_, "h264:trans8x8", 1);
@@ -860,110 +1099,6 @@ private:
     bool own_ = false;
 };
 
-struct NalUnit {
-    const uint8_t *data = nullptr;
-    size_t size = 0;
-};
-
-bool strip_annexb_start_code(const uint8_t **data, size_t *size) {
-    if (*size >= 4 && (*data)[0] == 0 && (*data)[1] == 0 && (*data)[2] == 0 && (*data)[3] == 1) {
-        *data += 4;
-        *size -= 4;
-        return true;
-    }
-    if (*size >= 3 && (*data)[0] == 0 && (*data)[1] == 0 && (*data)[2] == 1) {
-        *data += 3;
-        *size -= 3;
-        return true;
-    }
-    return false;
-}
-
-size_t find_start_code(const uint8_t *data, size_t size, size_t pos, size_t *prefix) {
-    size_t i = pos;
-    while (i + 3 <= size) {
-        const void *next_zero = memchr(data + i, 0, size - i - 2);
-        if (!next_zero) return size;
-        i = static_cast<const uint8_t *>(next_zero) - data;
-
-        if (i + 4 <= size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
-            *prefix = 4;
-            return i;
-        }
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
-            *prefix = 3;
-            return i;
-        }
-        ++i;
-    }
-    return size;
-}
-
-std::vector<NalUnit> parse_annexb(const uint8_t *data, size_t size) {
-    std::vector<NalUnit> out;
-    size_t prefix = 0;
-    size_t start = find_start_code(data, size, 0, &prefix);
-    while (start < size) {
-        size_t nal_start = start + prefix;
-        size_t next_prefix = 0;
-        size_t next = find_start_code(data, size, nal_start, &next_prefix);
-        size_t nal_end = next;
-        while (nal_end > nal_start && data[nal_end - 1] == 0) --nal_end;
-        if (nal_end > nal_start) out.push_back({data + nal_start, nal_end - nal_start});
-        start = next;
-        prefix = next_prefix;
-    }
-    return out;
-}
-
-std::vector<NalUnit> nals_from_mpp_segments(const EncodedPacket &packet) {
-    std::vector<NalUnit> out;
-    if (!packet.mpp_packet || !packet.data || packet.len == 0) return out;
-
-    MppPacket mpp_packet = packet.mpp_packet.get();
-    RK_U32 segment_nb = mpp_packet_get_segment_nb(mpp_packet);
-    const MppPktSeg *seg = mpp_packet_get_segment_info(mpp_packet);
-    if (!segment_nb || !seg) return out;
-
-    out.reserve(segment_nb);
-    for (RK_U32 i = 0; i < segment_nb && seg; ++i, seg = seg->next) {
-        if (seg->offset > packet.len || seg->len > packet.len - seg->offset) {
-            out.clear();
-            return out;
-        }
-
-        const uint8_t *nal = packet.data + seg->offset;
-        size_t nal_size = seg->len;
-        strip_annexb_start_code(&nal, &nal_size);
-        while (nal_size > 0 && nal[nal_size - 1] == 0) --nal_size;
-        if (nal_size > 0) out.push_back({nal, nal_size});
-    }
-    return out;
-}
-
-std::vector<NalUnit> packet_nals(const EncodedPacket &packet) {
-    auto nals = nals_from_mpp_segments(packet);
-    if (!nals.empty()) return nals;
-    return parse_annexb(packet.data, packet.len);
-}
-
-std::string base64_encode(const uint8_t *data, size_t len) {
-    static const char table[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t v = data[i] << 16;
-        if (i + 1 < len) v |= data[i + 1] << 8;
-        if (i + 2 < len) v |= data[i + 2];
-        out.push_back(table[(v >> 18) & 0x3f]);
-        out.push_back(table[(v >> 12) & 0x3f]);
-        out.push_back(i + 1 < len ? table[(v >> 6) & 0x3f] : '=');
-        out.push_back(i + 2 < len ? table[v & 0x3f] : '=');
-    }
-    return out;
-}
-
 struct RtspUrl {
     std::string host;
     std::string port = "554";
@@ -990,16 +1125,6 @@ RtspUrl parse_rtsp_url(const std::string &url) {
     if (u.host.empty() || u.port.empty()) die("invalid RTSP URL host/port");
     return u;
 }
-
-class MediaOutput {
-public:
-    virtual ~MediaOutput() = default;
-    virtual void write_frame(const uint8_t *data, size_t len) = 0;
-    virtual void write_packet(const EncodedPacket &packet) { write_frame(packet.data, packet.len); }
-    virtual void write_audio_l16_s16le(const int16_t *samples, size_t frames) = 0;
-    virtual void write_audio_payload(const uint8_t *payload, size_t len, size_t frames) = 0;
-    virtual void log_stats() = 0;
-};
 
 class RtspPublisher : public MediaOutput {
 public:
@@ -1161,6 +1286,7 @@ private:
             "s=rk-hdmi-streamer\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "t=0 0\r\n"
+            "a=control:*\r\n"
             "m=video 0 RTP/AVP 96\r\n"
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile) +
@@ -1416,696 +1542,12 @@ private:
     uint64_t stats_last_partial_sends_ = 0;
 };
 
-class RtspServer : public MediaOutput {
-public:
-    RtspServer(const std::string &listen_addr,
-               const std::string &path,
-               const std::vector<uint8_t> &h264_header,
-               int fps,
-               bool audio,
-               const std::string &audio_codec,
-               int rtp_payload_size,
-               int max_clients)
-        : listen_addr_(listen_addr),
-          path_(path),
-          fps_(fps),
-          audio_enabled_(audio),
-          audio_codec_(audio_codec),
-          max_payload_(static_cast<size_t>(rtp_payload_size)),
-          max_clients_(max_clients) {
-        extract_sps_pps(h264_header);
-        listen_tcp();
-        running_.store(true, std::memory_order_relaxed);
-        accept_thread_ = std::thread([this] { accept_loop(); });
-    }
-
-    ~RtspServer() {
-        running_.store(false, std::memory_order_relaxed);
-        if (listen_fd_ >= 0) {
-            shutdown(listen_fd_, SHUT_RDWR);
-            close(listen_fd_);
-            listen_fd_ = -1;
-        }
-        if (accept_thread_.joinable()) accept_thread_.join();
-    }
-
-    bool has_clients() const {
-        return active_readers_.load(std::memory_order_relaxed) > 0;
-    }
-
-    bool wait_for_clients(std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> lock(active_mutex_);
-        active_cv_.wait_for(lock, timeout, [&] {
-            return !running_.load(std::memory_order_relaxed) || has_clients();
-        });
-        return has_clients();
-    }
-
-    void write_frame(const uint8_t *data, size_t len) override {
-        if (!has_clients()) return;
-
-        EncodedPacket packet{data, len, {}};
-        write_packet(packet);
-    }
-
-    void write_packet(const EncodedPacket &packet) override {
-        if (!has_clients() || !packet.data || packet.len == 0) return;
-
-        RtpStorage storage;
-        storage.packet = packet.mpp_packet;
-        if (storage.packet) {
-            storage.data = packet.data;
-            storage.size = packet.len;
-        } else {
-            storage.bytes = std::make_shared<std::vector<uint8_t>>(packet.data, packet.data + packet.len);
-            storage.data = storage.bytes->data();
-            storage.size = storage.bytes->size();
-        }
-
-        EncodedPacket storage_packet{storage.data, storage.size, storage.packet};
-        auto nals = packet_nals(storage_packet);
-        if (nals.empty()) return;
-
-        size_t last_payload_nal = nals.size();
-        for (size_t i = nals.size(); i > 0; --i) {
-            uint8_t type = nals[i - 1].data[0] & 0x1f;
-            if (type != 9) {
-                last_payload_nal = i - 1;
-                break;
-            }
-        }
-        if (last_payload_nal == nals.size()) return;
-
-        std::vector<RtpChunk> chunks;
-        chunks.reserve(nals.size() + storage.size / max_payload_ + 1);
-        for (size_t i = 0; i < nals.size(); ++i) {
-            uint8_t type = nals[i].data[0] & 0x1f;
-            if (type == 9) continue;
-            size_t offset = static_cast<size_t>(nals[i].data - storage.data);
-            add_video_nal(chunks, storage, offset, nals[i].size, i == last_payload_nal);
-        }
-        broadcast(chunks);
-        video_timestamp_ += 90000 / fps_;
-    }
-
-    void write_audio_l16_s16le(const int16_t *samples, size_t frames) override {
-        if (!audio_enabled_ || frames == 0 || !has_clients()) return;
-
-        constexpr size_t channels = 2;
-        auto payload = std::make_shared<std::vector<uint8_t>>(frames * channels * sizeof(int16_t));
-        for (size_t i = 0; i < frames * channels; ++i) {
-            uint16_t sample = static_cast<uint16_t>(samples[i]);
-            (*payload)[i * 2 + 0] = static_cast<uint8_t>(sample >> 8);
-            (*payload)[i * 2 + 1] = static_cast<uint8_t>(sample);
-        }
-
-        RtpChunk chunk{};
-        chunk.channel = 2;
-        chunk.payload_type = 97;
-        chunk.timestamp = audio_timestamp_;
-        chunk.marker = audio_marker_;
-        chunk.storage.bytes = payload;
-        chunk.storage.data = payload->data();
-        chunk.storage.size = payload->size();
-        chunk.offset = 0;
-        chunk.size = payload->size();
-        audio_marker_ = false;
-        audio_timestamp_ += frames;
-        broadcast(std::vector<RtpChunk>{chunk});
-    }
-
-    void write_audio_payload(const uint8_t *payload, size_t len, size_t frames) override {
-        if (!audio_enabled_ || len == 0 || frames == 0 || !has_clients()) return;
-        auto data = std::make_shared<std::vector<uint8_t>>(payload, payload + len);
-        RtpChunk chunk{};
-        chunk.channel = 2;
-        chunk.payload_type = 97;
-        chunk.timestamp = audio_timestamp_;
-        chunk.marker = audio_marker_;
-        chunk.storage.bytes = data;
-        chunk.storage.data = data->data();
-        chunk.storage.size = data->size();
-        chunk.offset = 0;
-        chunk.size = data->size();
-        audio_marker_ = false;
-        audio_timestamp_ += frames;
-        broadcast(std::vector<RtpChunk>{chunk});
-    }
-
-    void log_stats() override {
-        auto now = std::chrono::steady_clock::now();
-        double secs = std::chrono::duration<double>(now - stats_last_time_).count();
-        if (secs <= 0.0) return;
-        uint64_t bytes = send_bytes_.load(std::memory_order_relaxed);
-        uint64_t packets = rtp_packets_.load(std::memory_order_relaxed);
-        uint64_t drops = queue_drops_.load(std::memory_order_relaxed);
-        uint64_t d_bytes = bytes - stats_last_send_bytes_;
-        uint64_t d_packets = packets - stats_last_rtp_packets_;
-        uint64_t d_drops = drops - stats_last_queue_drops_;
-        fprintf(stderr,
-                "rtsp server clients=%d net Mbps=%.2f rtp_packets/s=%.0f queue_drops=%llu\n",
-                active_readers_.load(std::memory_order_relaxed),
-                static_cast<double>(d_bytes) * 8.0 / secs / 1000000.0,
-                static_cast<double>(d_packets) / secs,
-                static_cast<unsigned long long>(d_drops));
-        stats_last_time_ = now;
-        stats_last_send_bytes_ = bytes;
-        stats_last_rtp_packets_ = packets;
-        stats_last_queue_drops_ = drops;
-    }
-
-private:
-    struct RtpStorage {
-        SharedMppPacket packet;
-        std::shared_ptr<std::vector<uint8_t>> bytes;
-        const uint8_t *data = nullptr;
-        size_t size = 0;
-    };
-
-    struct RtpChunk {
-        uint8_t channel = 0;
-        uint8_t payload_type = 96;
-        uint32_t timestamp = 0;
-        bool marker = false;
-        RtpStorage storage;
-        size_t offset = 0;
-        size_t size = 0;
-        uint8_t prefix[2] = {};
-        size_t prefix_size = 0;
-
-        size_t payload_size() const { return prefix_size + size; }
-        size_t wire_size() const { return 4 + 12 + payload_size(); }
-    };
-
-    class Session : public std::enable_shared_from_this<Session> {
-    public:
-        Session(RtspServer &server, int fd, uint64_t id)
-            : server_(server), fd_(fd), id_(id) {
-            int yes = 1;
-            setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-        }
-
-        ~Session() {
-            close_socket();
-        }
-
-        void start() {
-            auto self = shared_from_this();
-            std::thread([self] { self->read_loop(); }).detach();
-            std::thread([self] { self->write_loop(); }).detach();
-        }
-
-        bool closed() const { return closed_.load(std::memory_order_relaxed); }
-        bool playing() const { return playing_.load(std::memory_order_relaxed); }
-        uint64_t id() const { return id_; }
-
-        void enqueue(const std::vector<RtpChunk> &chunks) {
-            if (!playing() || closed()) return;
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            for (const auto &chunk : chunks) {
-                size_t bytes = chunk.wire_size();
-                while (!queue_.empty() && queue_bytes_ + bytes > max_queue_bytes_) {
-                    queue_bytes_ -= queue_.front().wire_size();
-                    queue_.pop_front();
-                    ++dropped_;
-                    server_.queue_drops_.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (bytes > max_queue_bytes_) continue;
-                queue_.push_back(chunk);
-                queue_bytes_ += bytes;
-            }
-            queue_cv_.notify_one();
-        }
-
-    private:
-        static constexpr size_t max_queue_bytes_ = 2 * 1024 * 1024;
-
-        void read_loop() {
-            std::string pending;
-            while (!closed()) {
-                std::string req;
-                if (!read_request(pending, req)) break;
-                if (!handle_request(req)) break;
-            }
-            bool was_playing = playing_.exchange(false, std::memory_order_relaxed);
-            if (was_playing) server_.reader_stopped();
-            closed_.store(true, std::memory_order_relaxed);
-            close_socket();
-            queue_cv_.notify_all();
-            server_.remove_session(id_);
-        }
-
-        bool read_request(std::string &pending, std::string &req) {
-            while (true) {
-                size_t hdr_end = pending.find("\r\n\r\n");
-                if (hdr_end != std::string::npos) {
-                    req = pending.substr(0, hdr_end + 4);
-                    pending.erase(0, hdr_end + 4);
-                    return true;
-                }
-                char buf[2048];
-                ssize_t n = recv(fd_, buf, sizeof(buf), 0);
-                if (n <= 0) return false;
-                pending.append(buf, buf + n);
-                if (pending.size() > 65536) return false;
-            }
-        }
-
-        static std::string first_line(const std::string &req) {
-            size_t end = req.find("\r\n");
-            return req.substr(0, end);
-        }
-
-        static std::string lower(std::string s) {
-            for (char &c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-            return s;
-        }
-
-        std::string header_value(const std::string &req, const std::string &name) {
-            std::string key = "\r\n" + lower(name) + ":";
-            std::string low = lower(req);
-            size_t pos = low.find(key);
-            if (pos == std::string::npos) return {};
-            pos += key.size();
-            while (pos < req.size() && (req[pos] == ' ' || req[pos] == '\t')) ++pos;
-            size_t end = req.find("\r\n", pos);
-            return req.substr(pos, end - pos);
-        }
-
-        bool handle_request(const std::string &req) {
-            std::string line = first_line(req);
-            std::istringstream is(line);
-            std::string method, url, version;
-            is >> method >> url >> version;
-            std::string cseq = header_value(req, "CSeq");
-            if (cseq.empty()) cseq = "1";
-
-            if (method == "OPTIONS") {
-                return send_response(cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n");
-            }
-            if (method == "DESCRIBE") {
-                std::string sdp = server_.sdp();
-                std::ostringstream resp;
-                resp << "RTSP/1.0 200 OK\r\n"
-                     << "CSeq: " << cseq << "\r\n"
-                     << "Content-Type: application/sdp\r\n"
-                     << "Content-Base: " << server_.content_base(url) << "\r\n"
-                     << "Content-Length: " << sdp.size() << "\r\n\r\n"
-                     << sdp;
-                return send_raw(resp.str());
-            }
-            if (method == "SETUP") {
-                bool audio = url.find("trackID=1") != std::string::npos;
-                if (audio && !server_.audio_enabled_) return send_error(cseq, 404, "Not Found");
-                if (session_id_.empty()) session_id_ = std::to_string(id_);
-                int rtp_ch = audio ? 2 : 0;
-                int rtcp_ch = audio ? 3 : 1;
-                std::ostringstream extra;
-                extra << "Transport: RTP/AVP/TCP;unicast;interleaved=" << rtp_ch << "-" << rtcp_ch << "\r\n"
-                      << "Session: " << session_id_ << "\r\n";
-                return send_response(cseq, extra.str());
-            }
-            if (method == "PLAY") {
-                if (!playing_.exchange(true, std::memory_order_relaxed)) server_.reader_started();
-                std::ostringstream extra;
-                extra << "Session: " << session_id_ << "\r\n"
-                      << "RTP-Info: url=" << server_.content_base(url) << "trackID=0"
-                      << ";seq=" << video_seq_ << ";rtptime=" << server_.video_timestamp() << "\r\n";
-                return send_response(cseq, extra.str());
-            }
-            if (method == "PAUSE") {
-                if (playing_.exchange(false, std::memory_order_relaxed)) server_.reader_stopped();
-                return send_response(cseq, "Session: " + session_id_ + "\r\n");
-            }
-            if (method == "TEARDOWN") {
-                send_response(cseq, "Session: " + session_id_ + "\r\n");
-                return false;
-            }
-            return send_error(cseq, 405, "Method Not Allowed");
-        }
-
-        bool send_response(const std::string &cseq, const std::string &extra) {
-            std::ostringstream resp;
-            resp << "RTSP/1.0 200 OK\r\n"
-                 << "CSeq: " << cseq << "\r\n"
-                 << extra
-                 << "\r\n";
-            return send_raw(resp.str());
-        }
-
-        bool send_error(const std::string &cseq, int code, const std::string &text) {
-            std::ostringstream resp;
-            resp << "RTSP/1.0 " << code << " " << text << "\r\n"
-                 << "CSeq: " << cseq << "\r\n\r\n";
-            return send_raw(resp.str());
-        }
-
-        bool send_raw(const std::string &resp) {
-            const uint8_t *data = reinterpret_cast<const uint8_t *>(resp.data());
-            size_t len = resp.size();
-            while (len) {
-                ssize_t n = send(fd_, data, len, MSG_NOSIGNAL);
-                if (n <= 0) return false;
-                data += n;
-                len -= static_cast<size_t>(n);
-            }
-            return true;
-        }
-
-        void write_loop() {
-            while (!closed()) {
-                RtpChunk chunk;
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex_);
-                    queue_cv_.wait(lock, [&] { return closed() || !queue_.empty(); });
-                    if (closed()) break;
-                    chunk = queue_.front();
-                    queue_.pop_front();
-                    queue_bytes_ -= chunk.wire_size();
-                }
-                if (!send_rtp(chunk)) break;
-            }
-            closed_.store(true, std::memory_order_relaxed);
-            close_socket();
-        }
-
-        bool send_rtp(const RtpChunk &chunk) {
-            uint16_t &seq = (chunk.channel == 0) ? video_seq_ : audio_seq_;
-            uint32_t ssrc = (chunk.channel == 0) ? video_ssrc_ : audio_ssrc_;
-            size_t payload_size = chunk.payload_size();
-            size_t rtp_len = 12 + payload_size;
-            if (rtp_len > 0xffff) return false;
-            uint8_t interleaved[4] = {
-                '$',
-                chunk.channel,
-                static_cast<uint8_t>(rtp_len >> 8),
-                static_cast<uint8_t>(rtp_len),
-            };
-            uint8_t rtp[12] = {
-                0x80,
-                static_cast<uint8_t>((chunk.marker ? 0x80 : 0x00) | chunk.payload_type),
-                static_cast<uint8_t>(seq >> 8),
-                static_cast<uint8_t>(seq),
-                static_cast<uint8_t>(chunk.timestamp >> 24),
-                static_cast<uint8_t>(chunk.timestamp >> 16),
-                static_cast<uint8_t>(chunk.timestamp >> 8),
-                static_cast<uint8_t>(chunk.timestamp),
-                static_cast<uint8_t>(ssrc >> 24),
-                static_cast<uint8_t>(ssrc >> 16),
-                static_cast<uint8_t>(ssrc >> 8),
-                static_cast<uint8_t>(ssrc),
-            };
-            ++seq;
-
-            iovec iov[4] = {
-                {interleaved, sizeof(interleaved)},
-                {rtp, sizeof(rtp)},
-                {const_cast<uint8_t *>(chunk.prefix), chunk.prefix_size},
-                {const_cast<uint8_t *>(chunk.storage.data + chunk.offset), chunk.size},
-            };
-            iovec *cur = iov;
-            int iovcnt = 4;
-            if (chunk.prefix_size == 0) {
-                iov[2] = iov[3];
-                iovcnt = 3;
-            }
-            while (iovcnt > 0) {
-                msghdr msg{};
-                msg.msg_iov = cur;
-                msg.msg_iovlen = static_cast<size_t>(iovcnt);
-                ssize_t n = sendmsg(fd_, &msg, MSG_NOSIGNAL);
-                if (n <= 0) return false;
-                server_.send_bytes_.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
-                ssize_t left = n;
-                while (iovcnt > 0 && left >= static_cast<ssize_t>(cur[0].iov_len)) {
-                    left -= static_cast<ssize_t>(cur[0].iov_len);
-                    ++cur;
-                    --iovcnt;
-                }
-                if (iovcnt > 0 && left > 0) {
-                    cur[0].iov_base = static_cast<uint8_t *>(cur[0].iov_base) + left;
-                    cur[0].iov_len -= static_cast<size_t>(left);
-                }
-            }
-            server_.rtp_packets_.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-
-        void close_socket() {
-            int fd = fd_.exchange(-1);
-            if (fd >= 0) {
-                shutdown(fd, SHUT_RDWR);
-                close(fd);
-            }
-        }
-
-        RtspServer &server_;
-        std::atomic_int fd_{-1};
-        uint64_t id_ = 0;
-        std::atomic_bool closed_{false};
-        std::atomic_bool playing_{false};
-        std::string session_id_;
-        uint16_t video_seq_ = 1;
-        uint16_t audio_seq_ = 1;
-        uint32_t video_ssrc_ = 0x524b5331; // "RKS1"
-        uint32_t audio_ssrc_ = 0x524b5332; // "RKS2"
-        std::mutex queue_mutex_;
-        std::condition_variable queue_cv_;
-        std::deque<RtpChunk> queue_;
-        size_t queue_bytes_ = 0;
-        uint64_t dropped_ = 0;
-    };
-
-    void extract_sps_pps(const std::vector<uint8_t> &header) {
-        for (const auto &nal : parse_annexb(header.data(), header.size())) {
-            uint8_t type = nal.data[0] & 0x1f;
-            if (type == 7) sps_.assign(nal.data, nal.data + nal.size);
-            if (type == 8) pps_.assign(nal.data, nal.data + nal.size);
-        }
-        if (sps_.size() < 4 || pps_.empty()) die("H.264 header did not contain SPS/PPS");
-    }
-
-    void listen_tcp() {
-        std::string host;
-        std::string port = listen_addr_;
-        size_t colon = listen_addr_.rfind(':');
-        if (colon != std::string::npos) {
-            host = listen_addr_.substr(0, colon);
-            port = listen_addr_.substr(colon + 1);
-        }
-        if (host.empty()) host = "0.0.0.0";
-
-        addrinfo hints{};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags = AI_PASSIVE;
-        addrinfo *res = nullptr;
-        int ret = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
-        if (ret) die(std::string("RTSP listen getaddrinfo failed: ") + gai_strerror(ret));
-
-        for (addrinfo *rp = res; rp; rp = rp->ai_next) {
-            listen_fd_ = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-            if (listen_fd_ < 0) continue;
-            int yes = 1;
-            setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-            if (bind(listen_fd_, rp->ai_addr, rp->ai_addrlen) == 0 &&
-                listen(listen_fd_, 8) == 0) {
-                break;
-            }
-            close(listen_fd_);
-            listen_fd_ = -1;
-        }
-        freeaddrinfo(res);
-        if (listen_fd_ < 0) die("failed to listen for RTSP clients on " + listen_addr_);
-        fprintf(stderr, "RTSP server listening on %s path=%s max_clients=%d\n",
-                listen_addr_.c_str(), path_.c_str(), max_clients_);
-    }
-
-    void accept_loop() {
-        while (running_.load(std::memory_order_relaxed)) {
-            int fd = accept(listen_fd_, nullptr, nullptr);
-            if (fd < 0) {
-                if (errno == EINTR) continue;
-                if (!running_.load(std::memory_order_relaxed)) break;
-                continue;
-            }
-
-            std::shared_ptr<Session> session;
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                purge_closed_locked();
-                if (static_cast<int>(sessions_.size()) >= max_clients_) {
-                    close(fd);
-                    continue;
-                }
-                session = std::make_shared<Session>(*this, fd, next_session_id_++);
-                sessions_.push_back(session);
-            }
-            session->start();
-        }
-    }
-
-    void purge_closed_locked() {
-        sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
-                                       [](const std::shared_ptr<Session> &s) { return s->closed(); }),
-                        sessions_.end());
-    }
-
-    void remove_session(uint64_t id) {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
-                                       [&](const std::shared_ptr<Session> &s) {
-                                           return s->closed() || s->id() == id;
-                                       }),
-                        sessions_.end());
-    }
-
-    void reader_started() {
-        active_readers_.fetch_add(1, std::memory_order_relaxed);
-        active_cv_.notify_all();
-    }
-
-    void reader_stopped() {
-        int prev = active_readers_.fetch_sub(1, std::memory_order_relaxed);
-        if (prev <= 1) {
-            active_readers_.store(0, std::memory_order_relaxed);
-            active_cv_.notify_all();
-        }
-    }
-
-    void broadcast(const std::vector<RtpChunk> &chunks) {
-        std::vector<std::shared_ptr<Session>> sessions;
-        {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            purge_closed_locked();
-            sessions = sessions_;
-        }
-        for (const auto &session : sessions) {
-            session->enqueue(chunks);
-        }
-    }
-
-    void add_video_nal(std::vector<RtpChunk> &chunks,
-                       const RtpStorage &storage,
-                       size_t offset,
-                       size_t len,
-                       bool marker) {
-        if (len <= max_payload_) {
-            RtpChunk chunk{};
-            chunk.channel = 0;
-            chunk.payload_type = 96;
-            chunk.timestamp = video_timestamp_;
-            chunk.marker = marker;
-            chunk.storage = storage;
-            chunk.offset = offset;
-            chunk.size = len;
-            chunks.push_back(std::move(chunk));
-            return;
-        }
-
-        uint8_t nal_header = storage.data[offset];
-        uint8_t fu_indicator = (nal_header & 0xe0) | 28;
-        uint8_t nal_type = nal_header & 0x1f;
-        size_t pos = 1;
-        bool start = true;
-        while (pos < len) {
-            size_t chunk_len = std::min(max_payload_ - 2, len - pos);
-            bool end = (pos + chunk_len) >= len;
-            RtpChunk chunk{};
-            chunk.channel = 0;
-            chunk.payload_type = 96;
-            chunk.timestamp = video_timestamp_;
-            chunk.marker = marker && end;
-            chunk.storage = storage;
-            chunk.offset = offset + pos;
-            chunk.size = chunk_len;
-            chunk.prefix[0] = fu_indicator;
-            chunk.prefix[1] = static_cast<uint8_t>((start ? 0x80 : 0x00) |
-                                                   (end ? 0x40 : 0x00) |
-                                                   nal_type);
-            chunk.prefix_size = 2;
-            chunks.push_back(std::move(chunk));
-            pos += chunk_len;
-            start = false;
-        }
-    }
-
-    std::string sdp() const {
-        char profile[7];
-        snprintf(profile, sizeof(profile), "%02x%02x%02x", sps_[1], sps_[2], sps_[3]);
-        std::string s =
-            "v=0\r\n"
-            "o=- 0 0 IN IP4 0.0.0.0\r\n"
-            "s=rk-hdmi-streamer\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "t=0 0\r\n"
-            "m=video 0 RTP/AVP 96\r\n"
-            "a=rtpmap:96 H264/90000\r\n"
-            "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile) +
-            ";sprop-parameter-sets=" + base64_encode(sps_.data(), sps_.size()) + "," +
-            base64_encode(pps_.data(), pps_.size()) + "\r\n"
-            "a=control:trackID=0\r\n";
-        if (audio_enabled_) {
-            s += "m=audio 0 RTP/AVP 97\r\n";
-            if (audio_codec_ == "opus") {
-                s +=
-                    "a=rtpmap:97 opus/48000/2\r\n"
-                    "a=fmtp:97 stereo=1;sprop-stereo=1;useinbandfec=0\r\n"
-                    "a=ptime:20\r\n"
-                    "a=maxptime:20\r\n";
-            } else {
-                s += "a=rtpmap:97 L16/48000/2\r\n";
-            }
-            s += "a=control:trackID=1\r\n";
-        }
-        return s;
-    }
-
-    std::string content_base(const std::string &url) const {
-        size_t track = url.find("/trackID=");
-        if (track != std::string::npos) return url.substr(0, track + 1);
-        if (!url.empty() && url.back() == '/') return url;
-        return url + "/";
-    }
-
-    uint32_t video_timestamp() const { return video_timestamp_; }
-
-    std::string listen_addr_;
-    std::string path_;
-    int fps_ = 30;
-    bool audio_enabled_ = false;
-    std::string audio_codec_;
-    size_t max_payload_ = 1200;
-    int max_clients_ = 3;
-    int listen_fd_ = -1;
-    std::atomic_bool running_{false};
-    std::thread accept_thread_;
-    std::mutex sessions_mutex_;
-    std::vector<std::shared_ptr<Session>> sessions_;
-    uint64_t next_session_id_ = 1;
-    std::atomic_int active_readers_{0};
-    std::mutex active_mutex_;
-    std::condition_variable active_cv_;
-    std::vector<uint8_t> sps_;
-    std::vector<uint8_t> pps_;
-    uint32_t video_timestamp_ = 0;
-    uint32_t audio_timestamp_ = 0;
-    bool audio_marker_ = true;
-    std::atomic<uint64_t> send_bytes_{0};
-    std::atomic<uint64_t> rtp_packets_{0};
-    std::atomic<uint64_t> queue_drops_{0};
-    std::chrono::steady_clock::time_point stats_last_time_ = std::chrono::steady_clock::now();
-    uint64_t stats_last_send_bytes_ = 0;
-    uint64_t stats_last_rtp_packets_ = 0;
-    uint64_t stats_last_queue_drops_ = 0;
-};
-
 class AlsaAudioCapture {
 public:
-    AlsaAudioCapture(const std::string &device, const std::string &codec, double gain)
-        : device_(device), codec_(codec), gain_(gain) {
+    AlsaAudioCapture(const std::string &device, const std::string &codec, double gain, size_t audio_frame_frames)
+        : device_(device), codec_(codec), gain_(gain), audio_frame_frames_(audio_frame_frames) {
         open_pcm();
-        buffer_.resize(read_frames_ * channels_);
+        buffer_.resize(audio_frame_frames_ * channels_);
 #ifdef HAVE_OPUS
         if (codec_ == "opus") {
             int err = 0;
@@ -2121,7 +1563,7 @@ public:
             opus_encoder_ctl(opus_, OPUS_SET_VBR(1));
             opus_encoder_ctl(opus_, OPUS_SET_VBR_CONSTRAINT(1));
             opus_packet_.resize(1500);
-            pending_.reserve(opus_frames_ * channels_ * 2);
+            pending_.reserve(audio_frame_frames_ * channels_ * 2);
         }
 #endif
     }
@@ -2139,7 +1581,7 @@ public:
     void run(std::atomic_bool &running, MediaOutput &publisher) {
         auto last_log = std::chrono::steady_clock::now();
         while (running.load(std::memory_order_relaxed)) {
-            snd_pcm_sframes_t frames = snd_pcm_readi(pcm_, buffer_.data(), read_frames_);
+            snd_pcm_sframes_t frames = snd_pcm_readi(pcm_, buffer_.data(), audio_frame_frames_);
             if (frames == -EPIPE) {
                 snd_pcm_prepare(pcm_);
                 continue;
@@ -2194,9 +1636,9 @@ private:
         if ((err = snd_pcm_hw_params_set_rate_near(pcm_, hw, &rate, nullptr)) < 0 || rate != sample_rate_) {
             die("ALSA set 48000Hz failed");
         }
-        snd_pcm_uframes_t period = read_frames_;
+        snd_pcm_uframes_t period = audio_frame_frames_;
         snd_pcm_hw_params_set_period_size_near(pcm_, hw, &period, nullptr);
-        snd_pcm_uframes_t buffer = read_frames_ * 8;
+        snd_pcm_uframes_t buffer = audio_frame_frames_ * 8;
         snd_pcm_hw_params_set_buffer_size_near(pcm_, hw, &buffer);
         if ((err = snd_pcm_hw_params(pcm_, hw)) < 0) die("ALSA apply hw params failed");
 
@@ -2249,12 +1691,12 @@ private:
     void write_opus(MediaOutput &publisher, const int16_t *samples, size_t frames) {
 #ifdef HAVE_OPUS
         pending_.insert(pending_.end(), samples, samples + frames * channels_);
-        const size_t needed_samples = opus_frames_ * channels_;
+        const size_t needed_samples = audio_frame_frames_ * channels_;
         while (pending_.size() >= needed_samples) {
-            int bytes = opus_encode(opus_, pending_.data(), opus_frames_,
+            int bytes = opus_encode(opus_, pending_.data(), static_cast<int>(audio_frame_frames_),
                                     opus_packet_.data(), static_cast<opus_int32>(opus_packet_.size()));
             if (bytes > 0) {
-                publisher.write_audio_payload(opus_packet_.data(), static_cast<size_t>(bytes), opus_frames_);
+                publisher.write_audio_payload(opus_packet_.data(), static_cast<size_t>(bytes), audio_frame_frames_);
                 ++audio_packets_;
             } else {
                 fprintf(stderr, "Opus encode failed: %s\n", opus_strerror(bytes));
@@ -2274,8 +1716,7 @@ private:
     snd_pcm_t *pcm_ = nullptr;
     static constexpr unsigned sample_rate_ = 48000;
     static constexpr unsigned channels_ = 2;
-    static constexpr snd_pcm_uframes_t read_frames_ = 480;
-    static constexpr int opus_frames_ = 960;
+    size_t audio_frame_frames_ = 960;
     std::vector<int16_t> buffer_;
     std::vector<int16_t> pending_;
     uint64_t audio_frames_ = 0;
@@ -2322,12 +1763,17 @@ int main(int argc, char **argv) {
         Options opt = parse_args(argc, argv);
 
         // Keep logs off stdout so stdout can be a clean H.264 bytestream.
-        fprintf(stderr, "capture=%s %dx%d@%d MJPEG, decoder=%s, h264_mpp bitrate=%d output=%s\n",
-                opt.device.c_str(), opt.width, opt.height, opt.fps, opt.decoder.c_str(),
+        fprintf(stderr, "capture=%s %dx%d@%d %s, profile=%s, decoder=%s, yuyv_converter=%s, h264_mpp bitrate=%d output=%s\n",
+                opt.device.c_str(), opt.width, opt.height, opt.fps,
+                input_format_label(opt.input_format),
+                opt.stream_profile.empty() ? "custom" : opt.stream_profile.c_str(),
+                opt.decoder.c_str(),
+                opt.yuyv_converter.c_str(),
                 opt.bitrate, opt.output.c_str());
 
         std::unique_ptr<TurboJpegDecoder> turbojpeg;
         std::unique_ptr<MppJpegDecoder> mppjpeg;
+        std::unique_ptr<MppDmabufPool> yuyv_rga_capture_pool;
         V4L2Capture cap(opt);
         cap.open_device();
 
@@ -2336,7 +1782,7 @@ int main(int argc, char **argv) {
         MppFrameFormat enc_fmt = MPP_FMT_YUV420P;
         bool enc_alloc_input = true;
 
-        if (opt.decoder == "mppjpeg") {
+        if (opt.input_format == "mjpeg" && opt.decoder == "mppjpeg") {
             mppjpeg = std::make_unique<MppJpegDecoder>(opt.width, opt.height);
             if (opt.v4l2_dmabuf) {
                 mppjpeg->init_capture_buffers(cap.buffer_size(), 6);
@@ -2345,12 +1791,37 @@ int main(int argc, char **argv) {
             enc_ver_stride = mppjpeg->ver_stride();
             enc_fmt = mppjpeg->format();
             enc_alloc_input = false;
-        } else {
+        } else if (opt.input_format == "mjpeg") {
             if (opt.v4l2_dmabuf) die("--v4l2-dmabuf requires --decoder mppjpeg");
             turbojpeg = std::make_unique<TurboJpegDecoder>(opt.width, opt.height);
+        } else {
+            enc_hor_stride = (opt.width + 15) & ~15;
+            enc_ver_stride = (opt.height + 15) & ~15;
+            enc_fmt = MPP_FMT_YUV420SP;
+            enc_alloc_input = true;
+            if (opt.yuyv_converter == "rga") {
+                yuyv_rga_capture_pool = std::make_unique<MppDmabufPool>(cap.buffer_size(), 6);
+            }
         }
 
         MppH264Encoder enc(opt, enc_hor_stride, enc_ver_stride, enc_fmt, enc_alloc_input);
+
+        std::unique_ptr<RgaYuyvToNv12Converter> yuyv_rga;
+        if (opt.input_format == "yuyv" && opt.yuyv_converter == "rga") {
+            if (!yuyv_rga_capture_pool) die("RGA capture dma-buf pool was not initialized");
+            RgaConverterConfig rga_cfg{};
+            rga_cfg.library_path = opt.rga_library;
+            rga_cfg.width = opt.width;
+            rga_cfg.height = opt.height;
+            rga_cfg.src_stride_bytes = static_cast<int>(cap.bytesperline());
+            rga_cfg.dst_hor_stride = enc_hor_stride;
+            rga_cfg.dst_ver_stride = enc_ver_stride;
+            rga_cfg.dst_fd = enc.input_buffer_fd();
+            rga_cfg.dst_size = enc.input_buffer_size();
+            yuyv_rga = std::make_unique<RgaYuyvToNv12Converter>(rga_cfg,
+                                                                yuyv_rga_capture_pool->buffers());
+            fprintf(stderr, "YUYV converter: RGA dma-buf path enabled\n");
+        }
 
         std::vector<uint8_t> h264_header;
         enc.write_header([&](const uint8_t *data, size_t len) {
@@ -2368,17 +1839,21 @@ int main(int argc, char **argv) {
         if (serve_rtsp) {
             rtsp_server = std::make_unique<RtspServer>(opt.listen_rtsp, opt.rtsp_path, h264_header,
                                                        opt.fps, opt.audio, opt.audio_codec,
-                                                       opt.rtp_payload_size, opt.max_clients);
+                                                       opt.rtp_payload_size, opt.audio_frame_frames,
+                                                       opt.rtsp_debug,
+                                                       opt.max_clients);
             media_output = rtsp_server.get();
         } else if (publish_rtsp) {
             rtsp = std::make_unique<RtspPublisher>(opt.output, h264_header, opt.fps, opt.audio,
                                                    opt.audio_codec, opt.rtp_payload_size);
             media_output = rtsp.get();
             if (opt.audio) {
-                audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec, opt.audio_gain);
+                audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec,
+                                                           opt.audio_gain, opt.audio_frame_frames);
                 audio_runtime.start(*audio, *media_output);
-                fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s gain=%.2f\n",
-                        opt.audio_device.c_str(), opt.audio_codec.c_str(), opt.audio_gain);
+                fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s frame_ms=%.1f gain=%.2f\n",
+                        opt.audio_device.c_str(), opt.audio_codec.c_str(),
+                        static_cast<double>(opt.audio_frame_frames) / 48.0, opt.audio_gain);
             }
         } else {
             out = std::make_unique<Output>(opt.output);
@@ -2393,20 +1868,35 @@ int main(int argc, char **argv) {
         int stats_captured = 0;
         int stats_skipped = 0;
         auto stats_start = std::chrono::steady_clock::now();
+        auto no_clients_since = std::chrono::steady_clock::time_point::min();
+        uint64_t capture_time_base_ns = 0;
+        uint32_t last_video_rtp_timestamp = 0;
+        bool have_video_rtp_timestamp = false;
         bool capture_started = false;
         auto start_capture = [&]() {
             if (capture_started) return;
-            cap.start(opt.v4l2_dmabuf ? &mppjpeg->capture_buffers() : nullptr);
+            const std::vector<MppBuffer> *capture_buffers = nullptr;
+            if (opt.input_format == "mjpeg" && opt.v4l2_dmabuf) {
+                capture_buffers = &mppjpeg->capture_buffers();
+            } else if (opt.input_format == "yuyv" && opt.yuyv_converter == "rga") {
+                capture_buffers = &yuyv_rga_capture_pool->buffers();
+            }
+            cap.start(capture_buffers);
             capture_started = true;
             stats_encoded = 0;
             stats_captured = 0;
             stats_skipped = 0;
             stats_start = std::chrono::steady_clock::now();
+            capture_time_base_ns = 0;
+            last_video_rtp_timestamp = 0;
+            have_video_rtp_timestamp = false;
             if (serve_rtsp && opt.audio) {
-                audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec, opt.audio_gain);
+                audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec,
+                                                           opt.audio_gain, opt.audio_frame_frames);
                 audio_runtime.start(*audio, *media_output);
-                fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s gain=%.2f\n",
-                        opt.audio_device.c_str(), opt.audio_codec.c_str(), opt.audio_gain);
+                fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s frame_ms=%.1f gain=%.2f\n",
+                        opt.audio_device.c_str(), opt.audio_codec.c_str(),
+                        static_cast<double>(opt.audio_frame_frames) / 48.0, opt.audio_gain);
             }
         };
 
@@ -2425,17 +1915,65 @@ int main(int argc, char **argv) {
             else out->write(packet.data, packet.len);
         };
 
+        auto capture_rtp_timestamp = [&](uint64_t timestamp_ns) -> uint32_t {
+            if (timestamp_ns == 0) timestamp_ns = monotonic_time_ns();
+            if (capture_time_base_ns == 0 || timestamp_ns < capture_time_base_ns) {
+                capture_time_base_ns = timestamp_ns;
+                last_video_rtp_timestamp = 0;
+                have_video_rtp_timestamp = true;
+                return 0;
+            }
+            uint64_t delta_ns = timestamp_ns - capture_time_base_ns;
+            uint64_t ts64 = (delta_ns * 90000ULL + 500000000ULL) / 1000000000ULL;
+            uint32_t ts = static_cast<uint32_t>(ts64);
+            if (have_video_rtp_timestamp && ts <= last_video_rtp_timestamp) {
+                ts = last_video_rtp_timestamp + static_cast<uint32_t>(std::max(1, 90000 / opt.fps));
+            }
+            last_video_rtp_timestamp = ts;
+            have_video_rtp_timestamp = true;
+            return ts;
+        };
+
         while (opt.frames == 0 || total_encoded < opt.frames) {
             if (serve_rtsp && !rtsp_server->has_clients()) {
+                if (capture_started && opt.rtsp_idle_grace_ms > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (no_clients_since == std::chrono::steady_clock::time_point::min()) {
+                        no_clients_since = now;
+                    }
+                    auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - no_clients_since).count();
+                    if (idle_ms < opt.rtsp_idle_grace_ms) {
+                        rtsp_server->wait_for_clients(std::chrono::milliseconds(100));
+                        continue;
+                    }
+                }
                 stop_capture();
+                no_clients_since = std::chrono::steady_clock::time_point::min();
                 rtsp_server->wait_for_clients(std::chrono::milliseconds(500));
                 continue;
             }
+            no_clients_since = std::chrono::steady_clock::time_point::min();
             if (serve_rtsp) start_capture();
 
-            cap.read_frame([&](const CapturedMjpegFrame &captured_frame) {
+            cap.read_frame([&](const CapturedFrame &captured_frame) {
                 ++stats_captured;
-                if (opt.decoder == "mppjpeg") {
+                uint32_t video_rtp_timestamp = capture_rtp_timestamp(captured_frame.timestamp_ns);
+                auto frame_writer = [&](EncodedPacket packet) {
+                    packet.rtp_timestamp = video_rtp_timestamp;
+                    packet.has_rtp_timestamp = true;
+                    writer(packet);
+                };
+                if (opt.input_format == "yuyv") {
+                    if (opt.yuyv_converter == "rga") {
+                        yuyv_rga->convert(captured_frame);
+                        enc.submit_nv12_frame(frame_writer);
+                    } else {
+                        enc.encode_yuyv_as_nv12(captured_frame.data,
+                                                captured_frame.bytesused,
+                                                captured_frame.bytesperline,
+                                                frame_writer);
+                    }
+                } else if (opt.decoder == "mppjpeg") {
                     MppFrame frame = mppjpeg->decode_to_frame(captured_frame);
                     if (!frame) {
                         ++stats_skipped;
@@ -2445,7 +1983,7 @@ int main(int argc, char **argv) {
                         }
                         return;
                     }
-                    enc.encode_mpp_frame(frame, writer);
+                    enc.encode_mpp_frame(frame, frame_writer);
                 } else {
                     const uint8_t *i420 = turbojpeg->decode_to_i420(captured_frame.data,
                                                                     captured_frame.bytesused);
@@ -2457,7 +1995,7 @@ int main(int argc, char **argv) {
                         }
                         return;
                     }
-                    enc.encode_i420(i420, writer);
+                    enc.encode_i420(i420, frame_writer);
                 }
                 ++total_encoded;
                 ++stats_encoded;

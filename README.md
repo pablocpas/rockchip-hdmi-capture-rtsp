@@ -59,6 +59,33 @@ This project has been tested most heavily with:
   For cameras, consoles, desktop capture, or other sources, choose the FPS that
   matches the source and the advertised V4L2 mode.
 
+## Quick Start
+
+Install the release binary and service files, run the configurator, then start
+the service:
+
+```bash
+tar -xzf rockchip-hdmi-capture-rtsp-*-linux-aarch64.tar.gz
+cd rockchip-hdmi-capture-rtsp-*-linux-aarch64
+sudo install -m 755 bin/rk-hdmi-streamer /usr/local/bin/rk-hdmi-streamer
+sudo install -m 644 systemd/rk-hdmi-streamer.env /etc/default/rk-hdmi-streamer
+sudo install -m 644 systemd/rk-hdmi-streamer-direct.service /etc/systemd/system/rk-hdmi-streamer.service
+sudo scripts/configure.sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now rk-hdmi-streamer.service
+scripts/doctor.sh
+```
+
+Open:
+
+```text
+rtsp://BOARD_IP:8554/capture
+```
+
+Run `sudo scripts/configure.sh` again whenever you change capture dongle, mode,
+FPS, bitrate, audio device, RTSP path, or profile. If the service is already
+installed, the configurator offers to restart it after writing the config.
+
 ## Installation
 
 The easiest path is to install a prebuilt `linux-aarch64` release binary. This
@@ -97,15 +124,14 @@ Install the direct RTSP service:
 ```bash
 sudo install -m 644 systemd/rk-hdmi-streamer.env /etc/default/rk-hdmi-streamer
 sudo install -m 644 systemd/rk-hdmi-streamer-direct.service /etc/systemd/system/rk-hdmi-streamer.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now rk-hdmi-streamer.service
 ```
 
-For a more plug-and-play setup, run the interactive configurator before
-starting the service:
+Run the interactive configurator before starting the service:
 
 ```bash
 sudo scripts/configure.sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now rk-hdmi-streamer.service
 scripts/doctor.sh
 ```
 
@@ -226,14 +252,14 @@ This installs `rk-hdmi-streamer` to `/usr/local/bin` by default.
 To build a release tarball from a Rockchip board:
 
 ```bash
-scripts/package-release.sh v0.1.0
+scripts/package-release.sh v0.2.0
 ```
 
 To include RGA support in the release binary when `librga` is checked out
 locally:
 
 ```bash
-RGA_ROOT="$HOME/librga" scripts/package-release.sh v0.1.0
+RGA_ROOT="$HOME/librga" scripts/package-release.sh v0.2.0
 ```
 
 When `RGA_ROOT` is set, the release package also includes:
@@ -249,8 +275,8 @@ The executable still loads `librga.so` dynamically at runtime only when the
 The generated files are written to `dist/`:
 
 ```text
-rockchip-hdmi-capture-rtsp-v0.1.0-linux-aarch64.tar.gz
-rockchip-hdmi-capture-rtsp-v0.1.0-linux-aarch64.tar.gz.sha256
+rockchip-hdmi-capture-rtsp-v0.2.0-linux-aarch64.tar.gz
+rockchip-hdmi-capture-rtsp-v0.2.0-linux-aarch64.tar.gz.sha256
 ```
 
 ## Find Capture Devices
@@ -275,14 +301,7 @@ useful because it requires much more USB bandwidth and needs an extra format
 conversion before hardware H.264 encoding. On Rockchip, that conversion can be
 done with `libyuv` on CPU or with RGA.
 
-## Plug-And-Play Configuration
-
-For MacroSilicon HDMI capture dongles, the easiest flow is:
-
-```bash
-sudo scripts/configure.sh
-scripts/doctor.sh
-```
+## Configuration Profiles
 
 `scripts/configure.sh` detects common MacroSilicon V4L2 nodes, asks which video
 and audio devices to use, writes `/etc/default/rk-hdmi-streamer`, and can
@@ -297,7 +316,8 @@ restart the systemd service after applying changes. It offers profiles by goal:
 | Custom | Manual tuning | For unusual capture cards, FPS, bitrate, or paths |
 
 `scripts/doctor.sh` checks the installed config, V4L2 formats, ALSA capture
-device, RTSP port, and service state. It does not modify the system.
+device, RGA availability, RTSP port, and service state. It does not modify the
+system.
 
 ### MacroSilicon MS2131 vs MS2109
 

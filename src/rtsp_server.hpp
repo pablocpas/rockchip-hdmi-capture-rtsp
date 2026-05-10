@@ -100,6 +100,10 @@ public:
         return has_clients();
     }
 
+    bool consume_keyframe_request() {
+        return keyframe_requested_.exchange(false, std::memory_order_relaxed);
+    }
+
     void write_frame(const uint8_t *data, size_t len) override {
         if (!has_clients()) return;
 
@@ -125,7 +129,7 @@ public:
         }
 
         EncodedPacket storage_packet{storage.data, storage.size, storage.packet, timestamp, true};
-        auto nals = packet_nals(storage_packet);
+        auto nals = video_nals(storage_packet);
         if (nals.empty()) return;
 
         size_t last_payload_nal = nals.size();
@@ -208,6 +212,26 @@ public:
                 static_cast<double>(d_bytes) * 8.0 / secs / 1000000.0,
                 static_cast<double>(d_packets) / secs,
                 static_cast<unsigned long long>(d_drops));
+        if (rtsp_debug_ && video_codec_ == VideoCodec::H265) {
+            uint64_t h265_single_nals = h265_single_nals_.load(std::memory_order_relaxed);
+            uint64_t h265_fu_nals = h265_fu_nals_.load(std::memory_order_relaxed);
+            uint64_t h265_fu_packets = h265_fu_packets_.load(std::memory_order_relaxed);
+            uint64_t h265_invalid_nals = h265_invalid_nals_.load(std::memory_order_relaxed);
+            uint64_t d_single = h265_single_nals - stats_last_h265_single_nals_;
+            uint64_t d_fu_nals = h265_fu_nals - stats_last_h265_fu_nals_;
+            uint64_t d_fu_packets = h265_fu_packets - stats_last_h265_fu_packets_;
+            uint64_t d_invalid = h265_invalid_nals - stats_last_h265_invalid_nals_;
+            fprintf(stderr,
+                    "rtsp h265 single_nals/s=%.0f fu_nals/s=%.0f fu_packets/s=%.0f invalid_nals/s=%.0f\n",
+                    static_cast<double>(d_single) / secs,
+                    static_cast<double>(d_fu_nals) / secs,
+                    static_cast<double>(d_fu_packets) / secs,
+                    static_cast<double>(d_invalid) / secs);
+            stats_last_h265_single_nals_ = h265_single_nals;
+            stats_last_h265_fu_nals_ = h265_fu_nals;
+            stats_last_h265_fu_packets_ = h265_fu_packets;
+            stats_last_h265_invalid_nals_ = h265_invalid_nals;
+        }
         stats_last_time_ = now;
         stats_last_send_bytes_ = bytes;
         stats_last_rtp_packets_ = packets;
@@ -680,7 +704,9 @@ private:
                 if (!was_playing) {
                     state_ = State::Playing;
                     playing_.store(true, std::memory_order_relaxed);
+                    if (video_track_.setup) enqueue_video_parameter_sets(server_.video_timestamp());
                     server_.commit_reader_start();
+                    if (video_track_.setup) server_.request_keyframe();
                     std::ostringstream detail;
                     detail << "tracks="
                            << (video_track_.setup ? "video" : "")
@@ -737,6 +763,11 @@ private:
 
         std::string session_header() const {
             return "Session: " + session_id_ + ";timeout=60\r\n";
+        }
+
+        void enqueue_video_parameter_sets(uint32_t timestamp) {
+            auto chunks = server_.video_parameter_set_chunks(timestamp);
+            if (!chunks.empty()) enqueue(chunks);
         }
 
         bool send_raw(const std::string &resp) {
@@ -999,6 +1030,14 @@ private:
         return video_codec_ == VideoCodec::H264 ? type == 9 : type == 35;
     }
 
+    std::vector<NalUnit> video_nals(const EncodedPacket &packet) const {
+        if (video_codec_ == VideoCodec::H265) {
+            auto parsed_nals = parse_annexb(packet.data, packet.len);
+            if (!parsed_nals.empty()) return parsed_nals;
+        }
+        return packet_nals(packet);
+    }
+
     void extract_video_parameter_sets(const std::vector<uint8_t> &header) {
         for (const auto &nal : parse_annexb(header.data(), header.size())) {
             uint8_t type = video_nal_type(nal);
@@ -1110,6 +1149,29 @@ private:
             active_readers_.fetch_add(1, std::memory_order_relaxed);
         }
         active_cv_.notify_all();
+    }
+
+    void request_keyframe() {
+        keyframe_requested_.store(true, std::memory_order_relaxed);
+    }
+
+    std::vector<RtpChunk> video_parameter_set_chunks(uint32_t timestamp) {
+        std::vector<const std::vector<uint8_t> *> parameter_sets;
+        if (video_codec_ == VideoCodec::H265) parameter_sets.push_back(&vps_);
+        parameter_sets.push_back(&sps_);
+        parameter_sets.push_back(&pps_);
+
+        std::vector<RtpChunk> chunks;
+        chunks.reserve(parameter_sets.size());
+        for (const auto *parameter_set : parameter_sets) {
+            if (!parameter_set || parameter_set->empty()) continue;
+            RtpStorage storage;
+            storage.bytes = std::make_shared<std::vector<uint8_t>>(*parameter_set);
+            storage.data = storage.bytes->data();
+            storage.size = storage.bytes->size();
+            add_video_nal(chunks, storage, timestamp, 0, storage.size, false);
+        }
+        return chunks;
     }
 
     void cancel_reader_start() {
@@ -1228,7 +1290,17 @@ private:
                       size_t offset,
                       size_t len,
                       bool marker) {
-        if (len <= max_payload_ || len < 3) {
+        if (len < 2 || offset > storage.size || len > storage.size - offset) {
+            h265_invalid_nals_.fetch_add(1, std::memory_order_relaxed);
+            if (rtsp_debug_) {
+                fprintf(stderr, "rtsp h265 invalid nal offset=%zu len=%zu storage=%zu\n",
+                        offset, len, storage.size);
+            }
+            return;
+        }
+
+        if (len <= max_payload_) {
+            if (rtsp_debug_) h265_single_nals_.fetch_add(1, std::memory_order_relaxed);
             RtpChunk chunk{};
             chunk.channel = 0;
             chunk.payload_type = 96;
@@ -1243,6 +1315,7 @@ private:
 
         const uint8_t *nal = storage.data + offset;
         uint8_t nal_type = (nal[0] >> 1) & 0x3f;
+        if (rtsp_debug_) h265_fu_nals_.fetch_add(1, std::memory_order_relaxed);
         uint8_t payload_header[2] = {
             static_cast<uint8_t>((nal[0] & 0x81) | (49 << 1)),
             nal[1],
@@ -1267,6 +1340,7 @@ private:
                                                    nal_type);
             chunk.prefix_size = 3;
             chunks.push_back(std::move(chunk));
+            if (rtsp_debug_) h265_fu_packets_.fetch_add(1, std::memory_order_relaxed);
             pos += chunk_len;
             start = false;
         }
@@ -1394,6 +1468,11 @@ private:
     std::vector<std::shared_ptr<Session>> sessions_;
     uint64_t next_session_id_ = 1;
     std::atomic_int active_readers_{0};
+    std::atomic_bool keyframe_requested_{false};
+    std::atomic<uint64_t> h265_single_nals_{0};
+    std::atomic<uint64_t> h265_fu_nals_{0};
+    std::atomic<uint64_t> h265_fu_packets_{0};
+    std::atomic<uint64_t> h265_invalid_nals_{0};
     std::mutex active_mutex_;
     int pending_readers_ = 0;
     std::condition_variable active_cv_;
@@ -1411,4 +1490,8 @@ private:
     uint64_t stats_last_send_bytes_ = 0;
     uint64_t stats_last_rtp_packets_ = 0;
     uint64_t stats_last_queue_drops_ = 0;
+    uint64_t stats_last_h265_single_nals_ = 0;
+    uint64_t stats_last_h265_fu_nals_ = 0;
+    uint64_t stats_last_h265_fu_packets_ = 0;
+    uint64_t stats_last_h265_invalid_nals_ = 0;
 };

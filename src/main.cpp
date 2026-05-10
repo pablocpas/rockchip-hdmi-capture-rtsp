@@ -70,6 +70,7 @@ struct Options {
     size_t audio_frame_frames = 960; // 20 ms at 48 kHz.
     bool audio = true;
     bool v4l2_dmabuf = false;
+    bool mppjpeg_copy_output = false;
     bool rtsp_debug = false;
     int rtsp_idle_grace_ms = 3000;
     int rtp_payload_size = 1400;
@@ -124,6 +125,8 @@ void usage(const char *argv0) {
             "  --yuyv-converter NAME libyuv or rga for YUYV input (default libyuv)\n"
             "  --rga-library PATH Override librga.so path for --yuyv-converter rga\n"
             "  --v4l2-dmabuf      Capture V4L2 MJPEG directly into MPP/DRM dma-buf buffers\n"
+            "  --no-v4l2-dmabuf   Disable V4L2 dma-buf capture even when the selected profile enables it\n"
+            "  --mppjpeg-copy-output Copy MPP JPEG decoder output into an encoder-owned buffer\n"
             "  --output PATH      Annex-B video output path or - for stdout (default -)\n"
             "  --listen-rtsp ADDR Listen as RTSP/TCP server, e.g. :8554 or 0.0.0.0:8554\n"
             "  --rtsp-path PATH   RTSP server path (default /capture)\n"
@@ -188,6 +191,13 @@ Options parse_args(int argc, char **argv) {
         else if (arg == "--v4l2-dmabuf") {
             opt.v4l2_dmabuf = true;
             v4l2_dmabuf_set = true;
+        }
+        else if (arg == "--no-v4l2-dmabuf") {
+            opt.v4l2_dmabuf = false;
+            v4l2_dmabuf_set = true;
+        }
+        else if (arg == "--mppjpeg-copy-output" || arg == "--no-mppjpeg-zero-copy") {
+            opt.mppjpeg_copy_output = true;
         }
         else if (arg == "--output") opt.output = need_value("--output");
         else if (arg == "--listen-rtsp") opt.listen_rtsp = need_value("--listen-rtsp");
@@ -584,19 +594,35 @@ public:
         hor_stride_ = align16(width_);
         ver_stride_ = align16(height_);
         tight_i420_.resize(width_ * height_ * 3 / 2);
-        init();
+        try {
+            init();
+        } catch (...) {
+            cleanup();
+            throw;
+        }
     }
 
     ~MppJpegDecoder() {
+        cleanup();
+    }
+
+    void cleanup() {
         if (frame_) mpp_frame_deinit(&frame_);
         for (auto &b : capture_packet_bufs_) {
             if (b) mpp_buffer_put(b);
+            b = nullptr;
         }
+        capture_packet_bufs_.clear();
         if (frame_buf_) mpp_buffer_put(frame_buf_);
+        frame_buf_ = nullptr;
         if (packet_buf_) mpp_buffer_put(packet_buf_);
+        packet_buf_ = nullptr;
         if (buf_grp_) mpp_buffer_group_put(buf_grp_);
+        buf_grp_ = nullptr;
         if (cfg_) mpp_dec_cfg_deinit(cfg_);
+        cfg_ = nullptr;
         if (ctx_) mpp_destroy(ctx_);
+        ctx_ = nullptr;
     }
 
     int hor_stride() const { return hor_stride_; }
@@ -622,6 +648,10 @@ public:
         if (jpeg_size > packet_buf_size_) die("MJPEG frame is larger than packet buffer");
 
         memcpy(mpp_buffer_get_ptr(packet_buf_), jpeg, jpeg_size);
+        MPP_RET sync_ret = mpp_buffer_sync_end(packet_buf_);
+        if (sync_ret) {
+            fprintf(stderr, "warning: mpp_buffer_sync_end jpeg packet failed ret=%d\n", sync_ret);
+        }
         ++copied_packets_;
 
         MppPacket packet = nullptr;
@@ -736,7 +766,12 @@ private:
         MppFrameFormat fmt = mpp_frame_get_fmt(frame);
         int hs = mpp_frame_get_hor_stride(frame);
         int vs = mpp_frame_get_ver_stride(frame);
-        auto *src = static_cast<uint8_t *>(mpp_buffer_get_ptr(mpp_frame_get_buffer(frame)));
+        MppBuffer buffer = mpp_frame_get_buffer(frame);
+        MPP_RET sync_ret = mpp_buffer_sync_ro_begin(buffer);
+        if (sync_ret) {
+            fprintf(stderr, "warning: mpp_buffer_sync_ro_begin decoder frame failed ret=%d\n", sync_ret);
+        }
+        auto *src = static_cast<uint8_t *>(mpp_buffer_get_ptr(buffer));
         uint8_t *dy = tight_i420_.data();
         uint8_t *du = dy + width_ * height_;
         uint8_t *dv = du + width_ * height_ / 4;
@@ -765,6 +800,10 @@ private:
             }
         } else {
             die("unsupported MPP JPEG output format");
+        }
+        sync_ret = mpp_buffer_sync_ro_end(buffer);
+        if (sync_ret) {
+            fprintf(stderr, "warning: mpp_buffer_sync_ro_end decoder frame failed ret=%d\n", sync_ret);
         }
     }
 
@@ -866,8 +905,28 @@ public:
 
     template <typename Writer>
     void encode_i420(const uint8_t *i420, Writer writer) {
-        void *dst = mpp_buffer_get_ptr(frame_buf_);
-        memcpy(dst, i420, frame_size_);
+        auto *dst = static_cast<uint8_t *>(mpp_buffer_get_ptr(frame_buf_));
+        uint8_t *dst_y = dst;
+        uint8_t *dst_u = dst_y + static_cast<size_t>(hor_stride_) * ver_stride_;
+        uint8_t *dst_v = dst_u + static_cast<size_t>(hor_stride_ / 2) * (ver_stride_ / 2);
+        const uint8_t *src_y = i420;
+        const uint8_t *src_u = src_y + static_cast<size_t>(opt_.width) * opt_.height;
+        const uint8_t *src_v = src_u + static_cast<size_t>(opt_.width / 2) * (opt_.height / 2);
+
+        for (int y = 0; y < opt_.height; ++y) {
+            memcpy(dst_y + static_cast<size_t>(y) * hor_stride_,
+                   src_y + static_cast<size_t>(y) * opt_.width,
+                   opt_.width);
+        }
+        for (int y = 0; y < opt_.height / 2; ++y) {
+            memcpy(dst_u + static_cast<size_t>(y) * (hor_stride_ / 2),
+                   src_u + static_cast<size_t>(y) * (opt_.width / 2),
+                   opt_.width / 2);
+            memcpy(dst_v + static_cast<size_t>(y) * (hor_stride_ / 2),
+                   src_v + static_cast<size_t>(y) * (opt_.width / 2),
+                   opt_.width / 2);
+        }
+        sync_encoder_input_buffer();
 
         MppFrame frame = nullptr;
         if (mpp_frame_init(&frame)) die("mpp_frame_init failed");
@@ -901,6 +960,7 @@ public:
                                      opt_.width,
                                      opt_.height);
         if (ret) die("libyuv YUY2ToNV12 failed");
+        sync_encoder_input_buffer();
         submit_nv12_frame(writer);
         return;
 #endif
@@ -929,6 +989,7 @@ public:
             }
         }
 
+        sync_encoder_input_buffer();
         submit_nv12_frame(writer);
     }
 
@@ -966,6 +1027,54 @@ public:
         submit_frame(frame, writer);
     }
 
+    template <typename Writer>
+    void encode_mpp_frame_copy_nv12(MppFrame decoded, Writer writer) {
+        if (!frame_buf_) die("encoder copy mode requires an encoder input buffer");
+        if ((mpp_frame_get_fmt(decoded) & MPP_FRAME_FMT_MASK) != MPP_FMT_YUV420SP) {
+            die("encoder copy mode currently supports only NV12 decoder output");
+        }
+
+        MppBuffer src_buffer = mpp_frame_get_buffer(decoded);
+        MPP_RET sync_ret = mpp_buffer_sync_ro_begin(src_buffer);
+        if (sync_ret) {
+            fprintf(stderr, "warning: mpp_buffer_sync_ro_begin decoder frame failed ret=%d\n", sync_ret);
+        }
+
+        auto *src = static_cast<const uint8_t *>(mpp_buffer_get_ptr(src_buffer));
+        auto *dst = static_cast<uint8_t *>(mpp_buffer_get_ptr(frame_buf_));
+        int src_hor_stride = mpp_frame_get_hor_stride(decoded);
+        int src_ver_stride = mpp_frame_get_ver_stride(decoded);
+        const uint8_t *src_y = src;
+        const uint8_t *src_uv = src_y + static_cast<size_t>(src_hor_stride) * src_ver_stride;
+        uint8_t *dst_y = dst;
+        uint8_t *dst_uv = dst_y + static_cast<size_t>(hor_stride_) * ver_stride_;
+
+        for (int y = 0; y < opt_.height; ++y) {
+            memcpy(dst_y + static_cast<size_t>(y) * hor_stride_,
+                   src_y + static_cast<size_t>(y) * src_hor_stride,
+                   opt_.width);
+        }
+        for (int y = 0; y < opt_.height / 2; ++y) {
+            memcpy(dst_uv + static_cast<size_t>(y) * hor_stride_,
+                   src_uv + static_cast<size_t>(y) * src_hor_stride,
+                   opt_.width);
+        }
+
+        sync_ret = mpp_buffer_sync_ro_end(src_buffer);
+        if (sync_ret) {
+            fprintf(stderr, "warning: mpp_buffer_sync_ro_end decoder frame failed ret=%d\n", sync_ret);
+        }
+        sync_encoder_input_buffer();
+        submit_nv12_frame(writer);
+    }
+
+    void request_idr() {
+        MPP_RET ret = mpi_->control(ctx_, MPP_ENC_SET_IDR_FRAME, nullptr);
+        if (ret) {
+            fprintf(stderr, "warning: MPP_ENC_SET_IDR_FRAME failed ret=%d\n", ret);
+        }
+    }
+
 private:
     static size_t frame_size_for(MppFrameFormat fmt, int hor_stride, int ver_stride) {
         switch (fmt & MPP_FRAME_FMT_MASK) {
@@ -975,6 +1084,14 @@ private:
                 return static_cast<size_t>(hor_stride) * ver_stride * 3 / 2;
             default:
                 die("unsupported encoder input format");
+        }
+    }
+
+    void sync_encoder_input_buffer() {
+        if (!frame_buf_) return;
+        MPP_RET ret = mpp_buffer_sync_end(frame_buf_);
+        if (ret) {
+            fprintf(stderr, "warning: mpp_buffer_sync_end encoder input failed ret=%d\n", ret);
         }
     }
 
@@ -1823,14 +1940,30 @@ int main(int argc, char **argv) {
         bool enc_alloc_input = true;
 
         if (opt.input_format == "mjpeg" && opt.decoder == "mppjpeg") {
-            mppjpeg = std::make_unique<MppJpegDecoder>(opt.width, opt.height);
-            if (opt.v4l2_dmabuf) {
-                mppjpeg->init_capture_buffers(cap.buffer_size(), 6);
+            try {
+                mppjpeg = std::make_unique<MppJpegDecoder>(opt.width, opt.height);
+                if (opt.v4l2_dmabuf) {
+                    mppjpeg->init_capture_buffers(cap.buffer_size(), 6);
+                }
+            } catch (const std::exception &e) {
+                fprintf(stderr,
+                        "warning: MPP JPEG decoder unavailable (%s); falling back to turbojpeg without V4L2 DMABUF\n",
+                        e.what());
+                mppjpeg.reset();
+                opt.decoder = "turbojpeg";
+                opt.v4l2_dmabuf = false;
+                turbojpeg = std::make_unique<TurboJpegDecoder>(opt.width, opt.height);
             }
-            enc_hor_stride = mppjpeg->hor_stride();
-            enc_ver_stride = mppjpeg->ver_stride();
-            enc_fmt = mppjpeg->format();
-            enc_alloc_input = false;
+            if (mppjpeg) {
+                enc_hor_stride = mppjpeg->hor_stride();
+                enc_ver_stride = mppjpeg->ver_stride();
+                enc_fmt = mppjpeg->format();
+                enc_alloc_input = opt.mppjpeg_copy_output;
+                if (opt.mppjpeg_copy_output) {
+                    fprintf(stderr,
+                            "mppjpeg copy-output mode enabled: decoder output is copied into encoder-owned dma-buf\n");
+                }
+            }
         } else if (opt.input_format == "mjpeg") {
             if (opt.v4l2_dmabuf) die("--v4l2-dmabuf requires --decoder mppjpeg");
             turbojpeg = std::make_unique<TurboJpegDecoder>(opt.width, opt.height);
@@ -2001,6 +2134,9 @@ int main(int argc, char **argv) {
 
             cap.read_frame([&](const CapturedFrame &captured_frame) {
                 ++stats_captured;
+                if (serve_rtsp && rtsp_server->consume_keyframe_request()) {
+                    enc.request_idr();
+                }
                 uint32_t video_rtp_timestamp = capture_rtp_timestamp(captured_frame.timestamp_ns);
                 auto frame_writer = [&](EncodedPacket packet) {
                     packet.rtp_timestamp = video_rtp_timestamp;
@@ -2027,7 +2163,11 @@ int main(int argc, char **argv) {
                         }
                         return;
                     }
-                    enc.encode_mpp_frame(frame, frame_writer);
+                    if (opt.mppjpeg_copy_output) {
+                        enc.encode_mpp_frame_copy_nv12(frame, frame_writer);
+                    } else {
+                        enc.encode_mpp_frame(frame, frame_writer);
+                    }
                 } else {
                     const uint8_t *i420 = turbojpeg->decode_to_i420(captured_frame.data,
                                                                     captured_frame.bytesused);

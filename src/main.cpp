@@ -61,6 +61,7 @@ struct Options {
     std::string output = "-";
     std::string stream_profile;
     std::string input_format = "mjpeg";
+    std::string video_range = "limited";
     std::string yuyv_converter = "libyuv";
     std::string rga_library;
     std::string decoder = "mppjpeg";
@@ -122,6 +123,7 @@ void usage(const char *argv0) {
             "  --no-audio         Disable RTSP audio track\n"
             "  --stream-profile NAME mjpeg, rga, or yuyv-libyuv\n"
             "  --input-format FMT mjpeg or yuyv/yuy2 (default mjpeg)\n"
+            "  --video-range NAME full, limited, or unspecified (default limited)\n"
             "  --yuyv-converter NAME libyuv or rga for YUYV input (default libyuv)\n"
             "  --rga-library PATH Override librga.so path for --yuyv-converter rga\n"
             "  --v4l2-dmabuf      Capture V4L2 MJPEG directly into MPP/DRM dma-buf buffers\n"
@@ -178,6 +180,7 @@ Options parse_args(int argc, char **argv) {
         else if (arg == "--audio-frame-ms") opt.audio_frame_frames = parse_audio_frame_ms(need_value("--audio-frame-ms"));
         else if (arg == "--rtp-payload") opt.rtp_payload_size = atoi(need_value("--rtp-payload"));
         else if (arg == "--stream-profile") opt.stream_profile = need_value("--stream-profile");
+        else if (arg == "--video-range") opt.video_range = need_value("--video-range");
         else if (arg == "--input-format") {
             opt.input_format = need_value("--input-format");
             input_format_set = true;
@@ -299,6 +302,9 @@ Options parse_args(int argc, char **argv) {
     if (opt.video_codec != "h264" && opt.video_codec != "h265") {
         die("--video-codec must be h264 or h265");
     }
+    if (opt.video_range != "full" && opt.video_range != "limited" && opt.video_range != "unspecified") {
+        die("--video-range must be full, limited, or unspecified");
+    }
     if (opt.audio_codec != "l16" && opt.audio_codec != "opus") {
         die("--audio-codec must be l16 or opus");
     }
@@ -308,6 +314,12 @@ Options parse_args(int argc, char **argv) {
     }
 #endif
     return opt;
+}
+
+MppFrameColorRange video_range_from_options(const Options &opt) {
+    if (opt.video_range == "full") return MPP_FRAME_RANGE_JPEG;
+    if (opt.video_range == "limited") return MPP_FRAME_RANGE_MPEG;
+    return MPP_FRAME_RANGE_UNSPECIFIED;
 }
 
 struct MmapBuffer {
@@ -1164,7 +1176,7 @@ private:
         mpp_enc_cfg_set_s32(cfg_, "prep:hor_stride", hor_stride_);
         mpp_enc_cfg_set_s32(cfg_, "prep:ver_stride", ver_stride_);
         mpp_enc_cfg_set_s32(cfg_, "prep:format", fmt_);
-        mpp_enc_cfg_set_s32(cfg_, "prep:range", MPP_FRAME_RANGE_JPEG);
+        mpp_enc_cfg_set_s32(cfg_, "prep:range", video_range_from_options(opt_));
 
         mpp_enc_cfg_set_s32(cfg_, "rc:mode", MPP_ENC_RC_MODE_CBR);
         mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_flex", 0);
@@ -1919,12 +1931,13 @@ int main(int argc, char **argv) {
         Options opt = parse_args(argc, argv);
 
         // Keep logs off stdout so stdout can be a clean Annex-B bytestream.
-        fprintf(stderr, "capture=%s %dx%d@%d %s, profile=%s, decoder=%s, yuyv_converter=%s, %s_mpp bitrate=%d output=%s\n",
+        fprintf(stderr, "capture=%s %dx%d@%d %s, profile=%s, decoder=%s, yuyv_converter=%s, range=%s, %s_mpp bitrate=%d output=%s\n",
                 opt.device.c_str(), opt.width, opt.height, opt.fps,
                 input_format_label(opt.input_format),
                 opt.stream_profile.empty() ? "custom" : opt.stream_profile.c_str(),
                 opt.decoder.c_str(),
                 opt.yuyv_converter.c_str(),
+                opt.video_range.c_str(),
                 opt.video_codec.c_str(),
                 opt.bitrate, opt.output.c_str());
 

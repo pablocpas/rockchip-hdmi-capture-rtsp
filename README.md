@@ -18,7 +18,6 @@ boards where a full FFmpeg plus relay-server pipeline wastes too much CPU.
 - ALSA audio with Opus or L16 RTP payloads.
 - On-demand capture: the device starts when an RTSP client enters `PLAY`.
 - Small multi-client use, typically a few viewers.
-- Optional legacy MediaMTX publisher mode.
 
 ## Recommended Profiles
 
@@ -85,7 +84,7 @@ Install the release tarball:
 tar -xzf rockchip-hdmi-capture-rtsp-*-linux-aarch64.tar.gz
 cd rockchip-hdmi-capture-rtsp-*-linux-aarch64
 sudo install -m 755 bin/rk-hdmi-streamer /usr/local/bin/rk-hdmi-streamer
-sudo install -m 644 systemd/rk-hdmi-streamer.env /etc/default/rk-hdmi-streamer
+sudo install -m 644 systemd/rk-hdmi-streamer.conf /etc/rk-hdmi-streamer.conf
 sudo install -m 644 systemd/rk-hdmi-streamer-direct.service /etc/systemd/system/rk-hdmi-streamer.service
 ```
 
@@ -123,11 +122,12 @@ sudo ldconfig
 
 or point the config at it:
 
-```bash
-RGA_LIBRARY=/path/to/librga.so
+```ini
+[main]
+rga-library=/path/to/librga.so
 ```
 
-The main binary loads `librga.so` only when `STREAM_PROFILE=rga` is selected, so
+The main binary loads `librga.so` only when `stream-profile=rga` is selected, so
 systems without RGA can still use `mjpeg` and `yuyv-libyuv`.
 
 ## Configuration Files
@@ -135,28 +135,44 @@ systems without RGA can still use `mjpeg` and `yuyv-libyuv`.
 The systemd service reads:
 
 ```text
-/etc/default/rk-hdmi-streamer
+/etc/rk-hdmi-streamer.conf
 ```
 
-Useful keys:
+Example:
 
-```bash
-DEVICE=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
-AUDIO_DEVICE=hw:CARD=Video,DEV=0
-VIDEO_CODEC=h264
-STREAM_PROFILE=mjpeg
-WIDTH=1920
-HEIGHT=1080
-FPS=50
-BITRATE=18000000
-GOP=50
-LISTEN_RTSP=:8554
-RTSP_PATH=/capture
-RTSP_DEBUG=0
+```ini
+[main]
+device=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
+audio-device=hw:CARD=Video,DEV=0
+video-codec=h264
+audio-codec=opus
+stream-profile=mjpeg
+width=1920
+height=1080
+fps=50
+bitrate=18000000
+gop=50
+listen-rtsp=:8554
+rtsp-path=/capture
+
+[profile.720p50]
+path=/720p50
+stream-profile=rga
+width=1280
+height=720
+fps=50
+codec=h265
+bitrate=4000000
+gop=50
 ```
 
 Prefer `/dev/v4l/by-id/...video-index0` over `/dev/videoN`; the numeric node can
 change after reboot or replug.
+
+Extra RTSP profiles use `[profile.NAME]` sections. Each profile inherits
+`[main]` and overrides only the keys listed in its section. The default
+`rtsp-path` remains available, so the example exposes both `/capture` and
+`/720p50`.
 
 ## Diagnostics
 
@@ -264,9 +280,9 @@ rk-hdmi-streamer \
 Direct RTSP, best-performance RGA path:
 
 ```bash
-RGA_LIBRARY="$HOME/librga/libs/Linux/gcc-aarch64/librga.so" \
 rk-hdmi-streamer \
   --stream-profile rga \
+  --rga-library "$HOME/librga/libs/Linux/gcc-aarch64/librga.so" \
   --device /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0 \
   --audio-device hw:CARD=Video,DEV=0 \
   --audio-codec opus \
@@ -318,16 +334,16 @@ If video is black or has artifacts:
 
 - Run `scripts/doctor.sh`.
 - Confirm the dongle supports the requested mode with `v4l2-ctl`.
-- Try `STREAM_PROFILE=mjpeg` first.
-- If using RGA, confirm `RGA_LIBRARY` points to a valid `librga.so`.
+- Try `stream-profile=mjpeg` first.
+- If using RGA, confirm `rga-library` points to a valid `librga.so`.
 - Lower bitrate temporarily and check system logs.
 
 If audio is missing:
 
-- Check `arecord -l` and adjust `AUDIO_DEVICE`.
-- Try `AUDIO_CODEC=l16` to isolate Opus/client issues.
-- Increase `AUDIO_GAIN` if the source is quiet.
-- Use `AUDIO_FRAME_MS=20` for normal Opus RTP frame size.
+- Check `arecord -l` and adjust `audio-device`.
+- Try `audio-codec=l16` to isolate Opus/client issues.
+- Increase `audio-gain` if the source is quiet.
+- Use `audio-frame-ms=20` for normal Opus RTP frame size.
 - On VLC for Android, if audio works the first time but not after reopening the
   same RTSP stream, change VLC's advanced audio output from `AudioTrack` to
   `OpenSL ES`.
@@ -341,8 +357,6 @@ journalctl -u rk-hdmi-streamer.service -n 100 --no-pager
 ## Notes
 
 - Direct RTSP is preferred for this small-client use case.
-- MediaMTX publisher mode is still available through `--output rtsp://...` and
-  the legacy `systemd/rk-hdmi-streamer.service` unit.
 - CPU usage depends on bitrate, client count, kernel, MPP version, capture
   dongle, memory clocks, and whether the stream goes through a tunnel.
 

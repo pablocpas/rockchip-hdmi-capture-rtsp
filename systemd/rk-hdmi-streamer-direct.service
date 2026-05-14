@@ -6,26 +6,9 @@ Conflicts=mediamtx.service
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/default/rk-hdmi-streamer
-Environment=DEVICE=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
-Environment=AUDIO_DEVICE=hw:CARD=Video,DEV=0
-Environment=VIDEO_CODEC=h264
-Environment=AUDIO_CODEC=opus
-Environment=AUDIO_GAIN=3.0
-Environment=AUDIO_FRAME_MS=20
-Environment=STREAM_PROFILE=mjpeg
-Environment=WIDTH=1920
-Environment=HEIGHT=1080
-Environment=FPS=50
-Environment=BITRATE=18000000
-Environment=GOP=50
-Environment=RTP_PAYLOAD=1400
-Environment=CPU_GOVERNOR=performance
-Environment=LISTEN_RTSP=:8554
-Environment=RTSP_PATH=/capture
-Environment=MAX_CLIENTS=3
-ExecStartPre=+/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && printf "%%s\n" "$CPU_GOVERNOR" > "$g" || true; done'
-ExecStart=/usr/local/bin/rk-hdmi-streamer --stream-profile ${STREAM_PROFILE} --device ${DEVICE} --video-codec ${VIDEO_CODEC} --audio-device ${AUDIO_DEVICE} --audio-codec ${AUDIO_CODEC} --audio-gain ${AUDIO_GAIN} --audio-frame-ms ${AUDIO_FRAME_MS} --width ${WIDTH} --height ${HEIGHT} --fps ${FPS} --bitrate ${BITRATE} --gop ${GOP} --rtp-payload ${RTP_PAYLOAD} --listen-rtsp ${LISTEN_RTSP} --rtsp-path ${RTSP_PATH} --max-clients ${MAX_CLIENTS}
+Environment=CONFIG_FILE=/etc/rk-hdmi-streamer.conf
+ExecStartPre=+/bin/sh -c 'gov="$(sed -n "s/^[[:space:]]*cpu-governor[[:space:]]*=[[:space:]]*//p" "$CONFIG_FILE" 2>/dev/null | tail -n1)"; [ -n "$gov" ] || gov=performance; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && printf "%%s\n" "$gov" > "$g" || true; done'
+ExecStart=/usr/local/bin/rk-hdmi-streamer --config ${CONFIG_FILE}
 Restart=always
 RestartSec=2
 Nice=-5

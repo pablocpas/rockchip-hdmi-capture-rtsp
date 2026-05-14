@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-CONFIG_FILE="${CONFIG_FILE:-/etc/default/rk-hdmi-streamer}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/rk-hdmi-streamer.conf}"
 
 DEVICE="${DEVICE:-/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0}"
 AUDIO_DEVICE="${AUDIO_DEVICE:-hw:CARD=Video,DEV=0}"
@@ -17,10 +17,55 @@ LISTEN_RTSP="${LISTEN_RTSP:-:8554}"
 RTSP_PATH="${RTSP_PATH:-/capture}"
 RGA_LIBRARY="${RGA_LIBRARY:-}"
 
-if [ -r "$CONFIG_FILE" ]; then
-  # shellcheck disable=SC1090
-  . "$CONFIG_FILE"
-fi
+trim() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+load_config() {
+  cfg="$1"
+  [ -r "$cfg" ] || return 0
+  section=main
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line%%;*}"
+    line="$(trim "$line")"
+    [ -n "$line" ] || continue
+    case "$line" in
+      \[*\])
+        section="$(printf '%s' "$line" | sed 's/^\[//;s/\]$//' | tr '[:upper:]_' '[:lower:]-')"
+        continue
+        ;;
+    esac
+    [ "$section" = "main" ] || continue
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+    value="$(printf '%s' "$value" | sed 's/^"//;s/"$//;s/^'\''//;s/'\''$//')"
+    key="$(printf '%s' "$key" | tr '[:lower:]-' '[:upper:]_')"
+    case "$key" in
+      DEVICE) DEVICE="$value" ;;
+      AUDIO_DEVICE) AUDIO_DEVICE="$value" ;;
+      VIDEO_CODEC) VIDEO_CODEC="$value" ;;
+      AUDIO_CODEC) AUDIO_CODEC="$value" ;;
+      AUDIO_GAIN) AUDIO_GAIN="$value" ;;
+      AUDIO_FRAME_MS) AUDIO_FRAME_MS="$value" ;;
+      STREAM_PROFILE) STREAM_PROFILE="$value" ;;
+      RGA_LIBRARY) RGA_LIBRARY="$value" ;;
+      WIDTH) WIDTH="$value" ;;
+      HEIGHT) HEIGHT="$value" ;;
+      FPS) FPS="$value" ;;
+      BITRATE) BITRATE="$value" ;;
+      GOP) GOP="$value" ;;
+      RTP_PAYLOAD) RTP_PAYLOAD="$value" ;;
+      CPU_GOVERNOR) CPU_GOVERNOR="$value" ;;
+      LISTEN_RTSP) LISTEN_RTSP="$value" ;;
+      RTSP_PATH) RTSP_PATH="$value" ;;
+      MAX_CLIENTS) MAX_CLIENTS="$value" ;;
+      RTSP_DEBUG) RTSP_DEBUG="$value" ;;
+    esac
+  done <"$cfg"
+}
+
+load_config "$CONFIG_FILE"
 
 PASS=0
 WARN=0
@@ -302,14 +347,7 @@ fi
 
 section "Configured Direct Command"
 say "rk-hdmi-streamer \\"
-say "  --stream-profile $STREAM_PROFILE \\"
-say "  --device $DEVICE \\"
-say "  --video-codec $VIDEO_CODEC \\"
-say "  --audio-device $AUDIO_DEVICE \\"
-say "  --audio-codec $AUDIO_CODEC \\"
-say "  --width $WIDTH --height $HEIGHT --fps $FPS \\"
-say "  --bitrate $BITRATE --gop $GOP \\"
-say "  --listen-rtsp $LISTEN_RTSP --rtsp-path $RTSP_PATH"
+say "  --config $CONFIG_FILE"
 
 if [ "$STREAM_PROFILE" != "rga" ] &&
    [ -e "$DEVICE" ] &&

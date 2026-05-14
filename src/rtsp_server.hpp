@@ -19,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -39,6 +40,54 @@
 
 class RtspServer : public MediaOutput {
 public:
+    struct StreamProfile {
+        std::string name;
+        std::string path;
+        VideoCodec video_codec = VideoCodec::H264;
+        std::function<std::vector<uint8_t>()> video_header_provider;
+        int fps = 30;
+        bool audio = false;
+        std::string audio_codec;
+        size_t audio_frame_frames = 960;
+    };
+
+private:
+    struct ProfileState {
+        StreamProfile profile;
+        bool video_header_loaded = false;
+        std::vector<uint8_t> sps;
+        std::vector<uint8_t> pps;
+        std::vector<uint8_t> vps;
+    };
+
+public:
+    RtspServer(const std::string &listen_addr,
+               std::vector<StreamProfile> profiles,
+               int rtp_payload_size,
+               bool rtsp_debug,
+               int max_clients)
+        : listen_addr_(listen_addr),
+          max_payload_(static_cast<size_t>(rtp_payload_size)),
+          rtsp_debug_(rtsp_debug),
+          max_clients_(max_clients) {
+        if (profiles.empty()) rtsp_die("RTSP server requires at least one profile");
+        profiles_.reserve(profiles.size());
+        for (auto &profile : profiles) {
+            if (profile.path.empty() || profile.path[0] != '/') {
+                rtsp_die("RTSP profile path must start with /");
+            }
+            if (!profile.video_header_provider) {
+                rtsp_die("RTSP profile requires a video header provider");
+            }
+            ProfileState state;
+            state.profile = std::move(profile);
+            profiles_.push_back(std::move(state));
+        }
+        listen_tcp();
+        running_.store(true, std::memory_order_relaxed);
+        accept_thread_ = std::thread([this] { accept_loop(); });
+    }
+
     RtspServer(const std::string &listen_addr,
                const std::string &path,
                VideoCodec video_codec,
@@ -50,21 +99,20 @@ public:
                size_t audio_frame_frames,
                bool rtsp_debug,
                int max_clients)
-        : listen_addr_(listen_addr),
-          path_(path),
-          video_codec_(video_codec),
-          fps_(fps),
-          audio_enabled_(audio),
-          audio_codec_(audio_codec),
-          max_payload_(static_cast<size_t>(rtp_payload_size)),
-          audio_frame_frames_(audio_frame_frames),
-          rtsp_debug_(rtsp_debug),
-          max_clients_(max_clients) {
-        extract_video_parameter_sets(video_header);
-        listen_tcp();
-        running_.store(true, std::memory_order_relaxed);
-        accept_thread_ = std::thread([this] { accept_loop(); });
-    }
+        : RtspServer(listen_addr,
+                     std::vector<StreamProfile>{StreamProfile{
+                         "capture",
+                         path,
+                         video_codec,
+                         [video_header] { return video_header; },
+                         fps,
+                         audio,
+                         audio_codec,
+                         audio_frame_frames,
+                     }},
+                     rtp_payload_size,
+                     rtsp_debug,
+                     max_clients) {}
 
     ~RtspServer() {
         running_.store(false, std::memory_order_relaxed);
@@ -92,6 +140,11 @@ public:
         return active_readers_.load(std::memory_order_relaxed) > 0;
     }
 
+    int active_profile_index() const {
+        std::lock_guard<std::mutex> lock(active_mutex_);
+        return active_profile_index_;
+    }
+
     bool wait_for_clients(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(active_mutex_);
         active_cv_.wait_for(lock, timeout, [&] {
@@ -113,6 +166,7 @@ public:
 
     void write_packet(const EncodedPacket &packet) override {
         if (!has_clients() || !packet.data || packet.len == 0) return;
+        const ProfileState &profile = active_profile();
         uint32_t timestamp = packet.has_rtp_timestamp
             ? packet.rtp_timestamp
             : video_timestamp_.load(std::memory_order_relaxed);
@@ -129,12 +183,12 @@ public:
         }
 
         EncodedPacket storage_packet{storage.data, storage.size, storage.packet, timestamp, true};
-        auto nals = video_nals(storage_packet);
+        auto nals = video_nals(profile, storage_packet);
         if (nals.empty()) return;
 
         size_t last_payload_nal = nals.size();
         for (size_t i = nals.size(); i > 0; --i) {
-            if (!is_video_aud(nals[i - 1])) {
+            if (!is_video_aud(profile, nals[i - 1])) {
                 last_payload_nal = i - 1;
                 break;
             }
@@ -144,20 +198,20 @@ public:
         std::vector<RtpChunk> chunks;
         chunks.reserve(nals.size() + storage.size / max_payload_ + 1);
         for (size_t i = 0; i < nals.size(); ++i) {
-            if (is_video_aud(nals[i])) continue;
+            if (is_video_aud(profile, nals[i])) continue;
             size_t offset = static_cast<size_t>(nals[i].data - storage.data);
-            add_video_nal(chunks, storage, timestamp, offset, nals[i].size, i == last_payload_nal);
+            add_video_nal(profile, chunks, storage, timestamp, offset, nals[i].size, i == last_payload_nal);
         }
         broadcast(chunks);
         if (packet.has_rtp_timestamp) {
             video_timestamp_.store(timestamp, std::memory_order_relaxed);
         } else {
-            video_timestamp_.fetch_add(90000 / fps_, std::memory_order_relaxed);
+            video_timestamp_.fetch_add(90000 / profile.profile.fps, std::memory_order_relaxed);
         }
     }
 
     void write_audio_l16_s16le(const int16_t *samples, size_t frames) override {
-        if (!audio_enabled_ || frames == 0 || !has_clients()) return;
+        if (!active_audio_enabled() || frames == 0 || !has_clients()) return;
 
         constexpr size_t channels = 2;
         auto payload = std::make_shared<std::vector<uint8_t>>(frames * channels * sizeof(int16_t));
@@ -181,7 +235,7 @@ public:
     }
 
     void write_audio_payload(const uint8_t *payload, size_t len, size_t frames) override {
-        if (!audio_enabled_ || len == 0 || frames == 0 || !has_clients()) return;
+        if (!active_audio_enabled() || len == 0 || frames == 0 || !has_clients()) return;
         auto data = std::make_shared<std::vector<uint8_t>>(payload, payload + len);
         RtpChunk chunk{};
         chunk.channel = 2;
@@ -212,7 +266,11 @@ public:
                 static_cast<double>(d_bytes) * 8.0 / secs / 1000000.0,
                 static_cast<double>(d_packets) / secs,
                 static_cast<unsigned long long>(d_drops));
-        if (rtsp_debug_ && video_codec_ == VideoCodec::H265) {
+        int profile_index = active_profile_index();
+        bool active_h265 = profile_index >= 0 &&
+            profile_index < static_cast<int>(profiles_.size()) &&
+            profiles_[static_cast<size_t>(profile_index)].profile.video_codec == VideoCodec::H265;
+        if (rtsp_debug_ && active_h265) {
             uint64_t h265_single_nals = h265_single_nals_.load(std::memory_order_relaxed);
             uint64_t h265_fu_nals = h265_fu_nals_.load(std::memory_order_relaxed);
             uint64_t h265_fu_packets = h265_fu_packets_.load(std::memory_order_relaxed);
@@ -615,8 +673,15 @@ private:
                 return send_response(cseq, extra);
             }
             if (method == "DESCRIBE") {
-                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
-                std::string sdp = server_.sdp();
+                int request_profile = server_.resolve_profile_index(url);
+                if (request_profile < 0) return send_error(cseq, 404, "Not Found");
+                std::string sdp;
+                try {
+                    sdp = server_.sdp(request_profile);
+                } catch (const std::exception &e) {
+                    if (server_.rtsp_debug_) trace("DESCRIBE failed", e.what());
+                    return send_error(cseq, 500, "Internal Server Error");
+                }
                 std::ostringstream resp;
                 resp << "RTSP/1.0 200 OK\r\n"
                      << server_.response_common_headers(cseq)
@@ -627,14 +692,19 @@ private:
                 return send_raw(resp.str());
             }
             if (method == "SETUP") {
-                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
+                int request_profile = server_.resolve_profile_index(url);
+                if (request_profile < 0) return send_error(cseq, 404, "Not Found");
                 bool audio = url.find("trackID=1") != std::string::npos;
                 bool video = url.find("trackID=0") != std::string::npos;
                 if (!audio && !video) return send_error(cseq, 404, "Not Found");
-                if (audio && !server_.audio_enabled_) return send_error(cseq, 404, "Not Found");
+                if (audio && !server_.profile_audio_enabled(request_profile)) return send_error(cseq, 404, "Not Found");
+                if (profile_index_ >= 0 && profile_index_ != request_profile) {
+                    return send_error(cseq, 455, "Method Not Valid in This State");
+                }
                 if (!session_id_.empty() && !request_session_matches(req)) {
                     return send_error(cseq, 454, "Session Not Found");
                 }
+                profile_index_ = request_profile;
 
                 TrackState &track = audio ? audio_track_ : video_track_;
                 uint8_t default_rtp = audio ? 2 : 0;
@@ -664,7 +734,12 @@ private:
                 return send_response(cseq, extra.str());
             }
             if (method == "PLAY") {
-                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
+                int request_profile = server_.resolve_profile_index(url);
+                if (request_profile < 0) return send_error(cseq, 404, "Not Found");
+                if (profile_index_ >= 0 && profile_index_ != request_profile) {
+                    return send_error(cseq, 455, "Method Not Valid in This State");
+                }
+                if (profile_index_ < 0) profile_index_ = request_profile;
                 if (!video_track_.setup && !audio_track_.setup) return send_error(cseq, 455, "Method Not Valid in This State");
                 if (!require_session(req, cseq)) return true;
                 bool was_playing = playing_.load(std::memory_order_relaxed);
@@ -672,7 +747,9 @@ private:
                 bool first_reader = false;
                 if (!was_playing) {
                     clear_queue();
-                    first_reader = server_.prepare_reader_start();
+                    if (!server_.prepare_reader_start(profile_index_, first_reader)) {
+                        return send_error(cseq, 453, "Not Enough Bandwidth");
+                    }
                     prepared_reader = true;
                     if (first_reader) reset_tracks_for_new_epoch();
                 }
@@ -704,11 +781,12 @@ private:
                 if (!was_playing) {
                     state_ = State::Playing;
                     playing_.store(true, std::memory_order_relaxed);
-                    if (video_track_.setup) enqueue_video_parameter_sets(server_.video_timestamp());
+                    if (video_track_.setup) enqueue_video_parameter_sets(profile_index_, server_.video_timestamp());
                     server_.commit_reader_start();
                     if (video_track_.setup) server_.request_keyframe();
                     std::ostringstream detail;
-                    detail << "tracks="
+                    detail << "profile=" << server_.profile_name(profile_index_)
+                           << " tracks="
                            << (video_track_.setup ? "video" : "")
                            << (video_track_.setup && audio_track_.setup ? ",audio" : audio_track_.setup ? "audio" : "")
                            << " video_seq=" << video_track_.seq
@@ -722,7 +800,7 @@ private:
                 return true;
             }
             if (method == "PAUSE") {
-                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
+                if (server_.resolve_profile_index(url) < 0) return send_error(cseq, 404, "Not Found");
                 if (!require_session(req, cseq)) return true;
                 if (playing_.exchange(false, std::memory_order_relaxed)) {
                     clear_queue();
@@ -733,7 +811,7 @@ private:
                 return send_response(cseq, session_header());
             }
             if (method == "TEARDOWN") {
-                if (!server_.url_matches_stream(url)) return send_error(cseq, 404, "Not Found");
+                if (server_.resolve_profile_index(url) < 0) return send_error(cseq, 404, "Not Found");
                 if (!require_session(req, cseq)) return true;
                 clear_queue();
                 state_ = State::Teardown;
@@ -765,8 +843,8 @@ private:
             return "Session: " + session_id_ + ";timeout=60\r\n";
         }
 
-        void enqueue_video_parameter_sets(uint32_t timestamp) {
-            auto chunks = server_.video_parameter_set_chunks(timestamp);
+        void enqueue_video_parameter_sets(int profile_index, uint32_t timestamp) {
+            auto chunks = server_.video_parameter_set_chunks(profile_index, timestamp);
             if (!chunks.empty()) enqueue(chunks);
         }
 
@@ -1006,6 +1084,7 @@ private:
         State state_ = State::Init;
         TrackState video_track_;
         TrackState audio_track_;
+        int profile_index_ = -1;
         std::string cname_;
         std::string session_id_;
         std::chrono::steady_clock::time_point last_activity_ = std::chrono::steady_clock::now();
@@ -1019,41 +1098,64 @@ private:
         std::thread write_thread_;
     };
 
-    uint8_t video_nal_type(const NalUnit &nal) const {
-        if (video_codec_ == VideoCodec::H264) return nal.data[0] & 0x1f;
+    const ProfileState &active_profile() const {
+        int index = active_profile_index();
+        if (index < 0 || index >= static_cast<int>(profiles_.size())) return profiles_[0];
+        return profiles_[static_cast<size_t>(index)];
+    }
+
+    bool active_audio_enabled() const {
+        if (!has_clients()) return false;
+        return active_profile().profile.audio;
+    }
+
+    uint8_t video_nal_type(const ProfileState &profile, const NalUnit &nal) const {
+        if (profile.profile.video_codec == VideoCodec::H264) return nal.data[0] & 0x1f;
         if (nal.size < 2) return 0xff;
         return (nal.data[0] >> 1) & 0x3f;
     }
 
-    bool is_video_aud(const NalUnit &nal) const {
-        uint8_t type = video_nal_type(nal);
-        return video_codec_ == VideoCodec::H264 ? type == 9 : type == 35;
+    bool is_video_aud(const ProfileState &profile, const NalUnit &nal) const {
+        uint8_t type = video_nal_type(profile, nal);
+        return profile.profile.video_codec == VideoCodec::H264 ? type == 9 : type == 35;
     }
 
-    std::vector<NalUnit> video_nals(const EncodedPacket &packet) const {
-        if (video_codec_ == VideoCodec::H265) {
+    std::vector<NalUnit> video_nals(const ProfileState &profile, const EncodedPacket &packet) const {
+        if (profile.profile.video_codec == VideoCodec::H265) {
             auto parsed_nals = parse_annexb(packet.data, packet.len);
             if (!parsed_nals.empty()) return parsed_nals;
         }
         return packet_nals(packet);
     }
 
-    void extract_video_parameter_sets(const std::vector<uint8_t> &header) {
+    void ensure_video_parameter_sets(int profile_index) {
+        std::lock_guard<std::mutex> lock(profiles_mutex_);
+        if (profile_index < 0 || profile_index >= static_cast<int>(profiles_.size())) {
+            rtsp_die("invalid RTSP profile index");
+        }
+        ProfileState &profile = profiles_[static_cast<size_t>(profile_index)];
+        if (profile.video_header_loaded) return;
+        std::vector<uint8_t> header = profile.profile.video_header_provider();
+        extract_video_parameter_sets(profile, header);
+        profile.video_header_loaded = true;
+    }
+
+    void extract_video_parameter_sets(ProfileState &profile, const std::vector<uint8_t> &header) {
         for (const auto &nal : parse_annexb(header.data(), header.size())) {
-            uint8_t type = video_nal_type(nal);
-            if (video_codec_ == VideoCodec::H264) {
-                if (type == 7) sps_.assign(nal.data, nal.data + nal.size);
-                if (type == 8) pps_.assign(nal.data, nal.data + nal.size);
+            uint8_t type = video_nal_type(profile, nal);
+            if (profile.profile.video_codec == VideoCodec::H264) {
+                if (type == 7) profile.sps.assign(nal.data, nal.data + nal.size);
+                if (type == 8) profile.pps.assign(nal.data, nal.data + nal.size);
             } else {
-                if (type == 32) vps_.assign(nal.data, nal.data + nal.size);
-                if (type == 33) sps_.assign(nal.data, nal.data + nal.size);
-                if (type == 34) pps_.assign(nal.data, nal.data + nal.size);
+                if (type == 32) profile.vps.assign(nal.data, nal.data + nal.size);
+                if (type == 33) profile.sps.assign(nal.data, nal.data + nal.size);
+                if (type == 34) profile.pps.assign(nal.data, nal.data + nal.size);
             }
         }
-        if (video_codec_ == VideoCodec::H264) {
-            if (sps_.size() < 4 || pps_.empty()) rtsp_die("H.264 header did not contain SPS/PPS");
+        if (profile.profile.video_codec == VideoCodec::H264) {
+            if (profile.sps.size() < 4 || profile.pps.empty()) rtsp_die("H.264 header did not contain SPS/PPS");
         } else {
-            if (vps_.empty() || sps_.empty() || pps_.empty()) {
+            if (profile.vps.empty() || profile.sps.empty() || profile.pps.empty()) {
                 rtsp_die("H.265 header did not contain VPS/SPS/PPS");
             }
         }
@@ -1091,8 +1193,11 @@ private:
         }
         freeaddrinfo(res);
         if (listen_fd_ < 0) rtsp_die("failed to listen for RTSP clients on " + listen_addr_);
-        fprintf(stderr, "RTSP server listening on %s path=%s max_clients=%d\n",
-                listen_addr_.c_str(), path_.c_str(), max_clients_);
+        fprintf(stderr, "RTSP server listening on %s profiles=", listen_addr_.c_str());
+        for (size_t i = 0; i < profiles_.size(); ++i) {
+            fprintf(stderr, "%s%s", i ? "," : "", profiles_[i].profile.path.c_str());
+        }
+        fprintf(stderr, " max_clients=%d\n", max_clients_);
     }
 
     void accept_loop() {
@@ -1134,12 +1239,18 @@ private:
                         sessions_.end());
     }
 
-    bool prepare_reader_start() {
+    bool prepare_reader_start(int profile_index, bool &first_reader) {
         std::lock_guard<std::mutex> lock(active_mutex_);
-        bool first_reader = active_readers_.load(std::memory_order_relaxed) == 0 && pending_readers_ == 0;
+        if (profile_index < 0 || profile_index >= static_cast<int>(profiles_.size())) return false;
+        bool any_reader = active_readers_.load(std::memory_order_relaxed) > 0 || pending_readers_ > 0;
+        if (any_reader && active_profile_index_ != profile_index) return false;
+        first_reader = !any_reader;
         ++pending_readers_;
-        if (first_reader) reset_stream_timestamps();
-        return first_reader;
+        if (first_reader) {
+            active_profile_index_ = profile_index;
+            reset_stream_timestamps();
+        }
+        return true;
     }
 
     void commit_reader_start() {
@@ -1155,11 +1266,13 @@ private:
         keyframe_requested_.store(true, std::memory_order_relaxed);
     }
 
-    std::vector<RtpChunk> video_parameter_set_chunks(uint32_t timestamp) {
+    std::vector<RtpChunk> video_parameter_set_chunks(int profile_index, uint32_t timestamp) {
+        ensure_video_parameter_sets(profile_index);
+        const ProfileState &profile = profiles_[static_cast<size_t>(profile_index)];
         std::vector<const std::vector<uint8_t> *> parameter_sets;
-        if (video_codec_ == VideoCodec::H265) parameter_sets.push_back(&vps_);
-        parameter_sets.push_back(&sps_);
-        parameter_sets.push_back(&pps_);
+        if (profile.profile.video_codec == VideoCodec::H265) parameter_sets.push_back(&profile.vps);
+        parameter_sets.push_back(&profile.sps);
+        parameter_sets.push_back(&profile.pps);
 
         std::vector<RtpChunk> chunks;
         chunks.reserve(parameter_sets.size());
@@ -1169,7 +1282,7 @@ private:
             storage.bytes = std::make_shared<std::vector<uint8_t>>(*parameter_set);
             storage.data = storage.bytes->data();
             storage.size = storage.bytes->size();
-            add_video_nal(chunks, storage, timestamp, 0, storage.size, false);
+            add_video_nal(profile, chunks, storage, timestamp, 0, storage.size, false);
         }
         return chunks;
     }
@@ -1177,6 +1290,9 @@ private:
     void cancel_reader_start() {
         std::lock_guard<std::mutex> lock(active_mutex_);
         if (pending_readers_ > 0) --pending_readers_;
+        if (pending_readers_ == 0 && active_readers_.load(std::memory_order_relaxed) == 0) {
+            active_profile_index_ = -1;
+        }
     }
 
     void reader_stopped() {
@@ -1186,6 +1302,7 @@ private:
             int current = active_readers_.load(std::memory_order_relaxed);
             if (current <= 1) {
                 active_readers_.store(0, std::memory_order_relaxed);
+                if (pending_readers_ == 0) active_profile_index_ = -1;
                 notify = true;
             } else {
                 active_readers_.store(current - 1, std::memory_order_relaxed);
@@ -1225,13 +1342,14 @@ private:
         }
     }
 
-    void add_video_nal(std::vector<RtpChunk> &chunks,
+    void add_video_nal(const ProfileState &profile,
+                       std::vector<RtpChunk> &chunks,
                        const RtpStorage &storage,
                        uint32_t timestamp,
                        size_t offset,
                        size_t len,
                        bool marker) {
-        if (video_codec_ == VideoCodec::H265) {
+        if (profile.profile.video_codec == VideoCodec::H265) {
             add_h265_nal(chunks, storage, timestamp, offset, len, marker);
             return;
         }
@@ -1346,7 +1464,9 @@ private:
         }
     }
 
-    std::string sdp() const {
+    std::string sdp(int profile_index) {
+        ensure_video_parameter_sets(profile_index);
+        const ProfileState &profile = profiles_[static_cast<size_t>(profile_index)];
         std::string s =
             "v=0\r\n"
             "o=- 0 0 IN IP4 0.0.0.0\r\n"
@@ -1357,19 +1477,19 @@ private:
             "a=control:*\r\n"
             "a=range:npt=now-\r\n"
             "m=video 0 RTP/AVP 96\r\n";
-        if (video_codec_ == VideoCodec::H264) {
-            s += sdp_h264();
+        if (profile.profile.video_codec == VideoCodec::H264) {
+            s += sdp_h264(profile);
         } else {
-            s += sdp_h265();
+            s += sdp_h265(profile);
         }
-        if (audio_enabled_) {
+        if (profile.profile.audio) {
             s += "m=audio 0 RTP/AVP 97\r\n";
-            if (audio_codec_ == "opus") {
+            if (profile.profile.audio_codec == "opus") {
                 s +=
                     "a=rtpmap:97 opus/48000/2\r\n"
                     "a=fmtp:97 stereo=1;sprop-stereo=1;useinbandfec=0\r\n"
-                    "a=ptime:" + audio_frame_ms_string() + "\r\n"
-                    "a=maxptime:" + audio_frame_ms_string() + "\r\n";
+                    "a=ptime:" + audio_frame_ms_string(profile.profile.audio_frame_frames) + "\r\n"
+                    "a=maxptime:" + audio_frame_ms_string(profile.profile.audio_frame_frames) + "\r\n";
             } else {
                 s += "a=rtpmap:97 L16/48000/2\r\n";
             }
@@ -1378,23 +1498,24 @@ private:
         return s;
     }
 
-    std::string sdp_h264() const {
-        char profile[7];
-        snprintf(profile, sizeof(profile), "%02x%02x%02x", sps_[1], sps_[2], sps_[3]);
+    std::string sdp_h264(const ProfileState &profile) const {
+        char profile_id[7];
+        snprintf(profile_id, sizeof(profile_id), "%02x%02x%02x",
+                 profile.sps[1], profile.sps[2], profile.sps[3]);
         return
             "a=rtpmap:96 H264/90000\r\n"
-            "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile) +
-            ";sprop-parameter-sets=" + base64_encode(sps_.data(), sps_.size()) + "," +
-            base64_encode(pps_.data(), pps_.size()) + "\r\n"
+            "a=fmtp:96 packetization-mode=1;profile-level-id=" + std::string(profile_id) +
+            ";sprop-parameter-sets=" + base64_encode(profile.sps.data(), profile.sps.size()) + "," +
+            base64_encode(profile.pps.data(), profile.pps.size()) + "\r\n"
             "a=control:trackID=0\r\n";
     }
 
-    std::string sdp_h265() const {
+    std::string sdp_h265(const ProfileState &profile) const {
         return
             "a=rtpmap:96 H265/90000\r\n"
-            "a=fmtp:96 sprop-vps=" + base64_encode(vps_.data(), vps_.size()) +
-            ";sprop-sps=" + base64_encode(sps_.data(), sps_.size()) +
-            ";sprop-pps=" + base64_encode(pps_.data(), pps_.size()) + "\r\n"
+            "a=fmtp:96 sprop-vps=" + base64_encode(profile.vps.data(), profile.vps.size()) +
+            ";sprop-sps=" + base64_encode(profile.sps.data(), profile.sps.size()) +
+            ";sprop-pps=" + base64_encode(profile.pps.data(), profile.pps.size()) + "\r\n"
             "a=control:trackID=0\r\n";
     }
 
@@ -1420,12 +1541,20 @@ private:
         return path;
     }
 
-    bool url_matches_stream(const std::string &url) const {
+    int resolve_profile_index(const std::string &url) const {
         std::string path = path_from_rtsp_url(url);
-        if (path == path_) return true;
-        if (path == path_ + "/") return true;
-        std::string track_prefix = (path_ == "/") ? "/trackID=" : path_ + "/trackID=";
-        return path.rfind(track_prefix, 0) == 0;
+        for (size_t i = 0; i < profiles_.size(); ++i) {
+            const std::string &profile_path = profiles_[i].profile.path;
+            if (path == profile_path) return static_cast<int>(i);
+            if (path == profile_path + "/") return static_cast<int>(i);
+            std::string track_prefix = (profile_path == "/") ? "/trackID=" : profile_path + "/trackID=";
+            if (path.rfind(track_prefix, 0) == 0) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    bool url_matches_stream(const std::string &url) const {
+        return resolve_profile_index(url) >= 0;
     }
 
     std::string response_common_headers(const std::string &cseq) const {
@@ -1446,19 +1575,25 @@ private:
     uint32_t video_timestamp() const { return video_timestamp_.load(std::memory_order_relaxed); }
     uint32_t audio_timestamp() const { return audio_timestamp_.load(std::memory_order_relaxed); }
 
-    std::string audio_frame_ms_string() const {
-        if (audio_frame_frames_ == 120) return "2.5";
-        return std::to_string(audio_frame_frames_ / 48);
+    bool profile_audio_enabled(int profile_index) const {
+        if (profile_index < 0 || profile_index >= static_cast<int>(profiles_.size())) return false;
+        return profiles_[static_cast<size_t>(profile_index)].profile.audio;
+    }
+
+    std::string profile_name(int profile_index) const {
+        if (profile_index < 0 || profile_index >= static_cast<int>(profiles_.size())) return "";
+        return profiles_[static_cast<size_t>(profile_index)].profile.name;
+    }
+
+    std::string audio_frame_ms_string(size_t audio_frame_frames) const {
+        if (audio_frame_frames == 120) return "2.5";
+        return std::to_string(audio_frame_frames / 48);
     }
 
     std::string listen_addr_;
-    std::string path_;
-    VideoCodec video_codec_ = VideoCodec::H264;
-    int fps_ = 30;
-    bool audio_enabled_ = false;
-    std::string audio_codec_;
+    std::vector<ProfileState> profiles_;
+    mutable std::mutex profiles_mutex_;
     size_t max_payload_ = 1200;
-    size_t audio_frame_frames_ = 960;
     bool rtsp_debug_ = false;
     int max_clients_ = 3;
     int listen_fd_ = -1;
@@ -1473,12 +1608,10 @@ private:
     std::atomic<uint64_t> h265_fu_nals_{0};
     std::atomic<uint64_t> h265_fu_packets_{0};
     std::atomic<uint64_t> h265_invalid_nals_{0};
-    std::mutex active_mutex_;
+    mutable std::mutex active_mutex_;
     int pending_readers_ = 0;
+    int active_profile_index_ = -1;
     std::condition_variable active_cv_;
-    std::vector<uint8_t> sps_;
-    std::vector<uint8_t> pps_;
-    std::vector<uint8_t> vps_;
     std::atomic<uint32_t> video_timestamp_{0};
     std::atomic<uint32_t> audio_timestamp_{0};
     std::atomic_bool audio_marker_{true};

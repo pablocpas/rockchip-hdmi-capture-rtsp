@@ -23,6 +23,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -67,6 +68,7 @@ struct Options {
     std::string decoder = "mppjpeg";
     std::string listen_rtsp;
     std::string rtsp_path = "/capture";
+    std::vector<std::string> rtsp_profile_specs;
     double audio_gain = 1.0;
     size_t audio_frame_frames = 960; // 20 ms at 48 kHz.
     bool audio = true;
@@ -88,18 +90,18 @@ bool starts_with(const std::string &s, const std::string &prefix) {
     return s.rfind(prefix, 0) == 0;
 }
 
-bool env_truthy(const char *name) {
-    const char *value = getenv(name);
-    if (!value || !*value) return false;
-    std::string v(value);
+[[noreturn]] void die(const std::string &msg) {
+    throw std::runtime_error(msg);
+}
+
+bool parse_bool_value(const std::string &value) {
+    std::string v = value;
     std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
         return static_cast<char>(tolower(c));
     });
-    return v == "1" || v == "true" || v == "yes" || v == "on";
-}
-
-[[noreturn]] void die(const std::string &msg) {
-    throw std::runtime_error(msg);
+    if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+    if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+    die("boolean value must be true or false: " + value);
 }
 
 int xioctl(int fd, unsigned long request, void *arg) {
@@ -113,6 +115,7 @@ int xioctl(int fd, unsigned long request, void *arg) {
 void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options]\n"
+            "  --config PATH      Read INI configuration file before CLI options\n"
             "  --device PATH      V4L2 device (default /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0)\n"
             "  --video-codec NAME h264 or h265/hevc (default h264)\n"
             "  --audio-device ID  ALSA capture device (default hw:CARD=Video,DEV=0)\n"
@@ -132,6 +135,7 @@ void usage(const char *argv0) {
             "  --output PATH      Annex-B video output path or - for stdout (default -)\n"
             "  --listen-rtsp ADDR Listen as RTSP/TCP server, e.g. :8554 or 0.0.0.0:8554\n"
             "  --rtsp-path PATH   RTSP server path (default /capture)\n"
+            "  --rtsp-profile SPEC Add explicit RTSP profile: name=tv,path=/tv,stream-profile=rga,width=1280,height=720,fps=50,codec=h265,bitrate=4000000\n"
             "  --rtsp-debug       Log RTSP session state changes\n"
             "  --rtsp-idle-grace-ms N  Keep capture running briefly after last RTSP client (default 3000)\n"
             "  --max-clients N    Maximum RTSP server clients (default 3)\n"
@@ -145,6 +149,38 @@ void usage(const char *argv0) {
             argv0);
 }
 
+void apply_stream_profile_defaults(Options &opt,
+                                   const std::string &profile_name,
+                                   bool input_format_set,
+                                   bool yuyv_converter_set,
+                                   bool decoder_set,
+                                   bool v4l2_dmabuf_set) {
+    opt.stream_profile = profile_name;
+    if (opt.stream_profile == "default" || opt.stream_profile == "recommended") {
+        opt.stream_profile = "mjpeg";
+    }
+
+    if (opt.stream_profile == "mjpeg") {
+        if (!input_format_set) opt.input_format = "mjpeg";
+        if (!yuyv_converter_set) opt.yuyv_converter = "libyuv";
+        if (!decoder_set) opt.decoder = "mppjpeg";
+        if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = true;
+    } else if (opt.stream_profile == "rga") {
+        if (!input_format_set) opt.input_format = "yuyv";
+        if (!yuyv_converter_set) opt.yuyv_converter = "rga";
+        if (!decoder_set) opt.decoder = "mppjpeg";
+        if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = true;
+    } else if (opt.stream_profile == "yuyv-libyuv" || opt.stream_profile == "libyuv") {
+        opt.stream_profile = "yuyv-libyuv";
+        if (!input_format_set) opt.input_format = "yuyv";
+        if (!yuyv_converter_set) opt.yuyv_converter = "libyuv";
+        if (!decoder_set) opt.decoder = "mppjpeg";
+        if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = false;
+    } else {
+        die("stream-profile must be mjpeg, rga, or yuyv-libyuv");
+    }
+}
+
 size_t parse_audio_frame_ms(const char *value) {
     std::string s(value);
     if (s == "2.5") return 120;
@@ -156,12 +192,152 @@ size_t parse_audio_frame_ms(const char *value) {
     die("--audio-frame-ms must be one of: 2.5, 5, 10, 20, 40, 60");
 }
 
+struct OptionSetFlags {
+    bool input_format = false;
+    bool yuyv_converter = false;
+    bool decoder = false;
+    bool v4l2_dmabuf = false;
+};
+
+std::string trim_copy(const std::string &s);
+
+std::string normalized_key(std::string key) {
+    key = trim_copy(key);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(tolower(c == '_' ? '-' : c));
+    });
+    return key;
+}
+
+std::string unquote_config_value(std::string value) {
+    value = trim_copy(value);
+    if (value.size() >= 2 &&
+        ((value.front() == '"' && value.back() == '"') ||
+         (value.front() == '\'' && value.back() == '\''))) {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+void apply_option(Options &opt,
+                  OptionSetFlags &flags,
+                  const std::string &raw_key,
+                  const std::string &raw_value,
+                  const std::string &context) {
+    std::string key = normalized_key(raw_key);
+    std::string value = unquote_config_value(raw_value);
+    if (key == "device") opt.device = value;
+    else if (key == "video-codec" || key == "codec") opt.video_codec = value == "hevc" ? "h265" : value;
+    else if (key == "audio-device") opt.audio_device = value;
+    else if (key == "audio-codec") opt.audio_codec = value;
+    else if (key == "audio-gain") opt.audio_gain = atof(value.c_str());
+    else if (key == "audio-frame-ms") opt.audio_frame_frames = parse_audio_frame_ms(value.c_str());
+    else if (key == "audio") opt.audio = parse_bool_value(value);
+    else if (key == "rtp-payload") opt.rtp_payload_size = atoi(value.c_str());
+    else if (key == "stream-profile" || key == "profile") opt.stream_profile = value;
+    else if (key == "video-range") opt.video_range = value;
+    else if (key == "input-format") {
+        opt.input_format = value == "yuy2" ? "yuyv" : value;
+        flags.input_format = true;
+    } else if (key == "yuyv-converter") {
+        opt.yuyv_converter = value;
+        flags.yuyv_converter = true;
+    } else if (key == "rga-library") opt.rga_library = value;
+    else if (key == "v4l2-dmabuf") {
+        opt.v4l2_dmabuf = parse_bool_value(value);
+        flags.v4l2_dmabuf = true;
+    } else if (key == "mppjpeg-copy-output") opt.mppjpeg_copy_output = parse_bool_value(value);
+    else if (key == "output") opt.output = value;
+    else if (key == "listen-rtsp") opt.listen_rtsp = value;
+    else if (key == "rtsp-path" || key == "path") opt.rtsp_path = value;
+    else if (key == "rtsp-debug") opt.rtsp_debug = parse_bool_value(value);
+    else if (key == "rtsp-idle-grace-ms") opt.rtsp_idle_grace_ms = atoi(value.c_str());
+    else if (key == "max-clients") opt.max_clients = atoi(value.c_str());
+    else if (key == "cpu-governor") {
+        // Consumed by the systemd unit before starting the process.
+    }
+    else if (key == "decoder") {
+        opt.decoder = value;
+        flags.decoder = true;
+    } else if (key == "width") opt.width = atoi(value.c_str());
+    else if (key == "height") opt.height = atoi(value.c_str());
+    else if (key == "fps") opt.fps = atoi(value.c_str());
+    else if (key == "bitrate") opt.bitrate = atoi(value.c_str());
+    else if (key == "gop") opt.gop = atoi(value.c_str());
+    else if (key == "frames") opt.frames = atoi(value.c_str());
+    else die("unknown " + context + " option: " + raw_key);
+}
+
+void load_config_file(const std::string &path, Options &opt, OptionSetFlags &flags) {
+    std::ifstream file(path);
+    if (!file) die("failed to open config file: " + path);
+
+    std::string section = "main";
+    std::string profile_name;
+    std::vector<std::string> profile_parts;
+
+    auto flush_profile = [&]() {
+        if (profile_name.empty()) return;
+        std::string spec = "name=" + profile_name;
+        for (const std::string &part : profile_parts) spec += "," + part;
+        opt.rtsp_profile_specs.push_back(spec);
+        profile_name.clear();
+        profile_parts.clear();
+    };
+
+    std::string line;
+    int line_no = 0;
+    while (std::getline(file, line)) {
+        ++line_no;
+        size_t comment = line.find_first_of("#;");
+        if (comment != std::string::npos) line.resize(comment);
+        line = trim_copy(line);
+        if (line.empty()) continue;
+
+        if (line.front() == '[' && line.back() == ']') {
+            flush_profile();
+            section = normalized_key(line.substr(1, line.size() - 2));
+            if (section.rfind("profile.", 0) == 0) {
+                profile_name = section.substr(strlen("profile."));
+                if (profile_name.empty()) {
+                    die(path + ":" + std::to_string(line_no) + ": profile section requires a name");
+                }
+            } else if (section != "main") {
+                die(path + ":" + std::to_string(line_no) + ": unknown section [" + section + "]");
+            }
+            continue;
+        }
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            die(path + ":" + std::to_string(line_no) + ": expected key=value");
+        }
+        std::string key = normalized_key(line.substr(0, eq));
+        std::string value = unquote_config_value(line.substr(eq + 1));
+        if (section == "main") {
+            apply_option(opt, flags, key, value, path + ":" + std::to_string(line_no));
+        } else if (!profile_name.empty()) {
+            if (key == "name") profile_name = value;
+            else profile_parts.push_back(key + "=" + value);
+        }
+    }
+    flush_profile();
+}
+
 Options parse_args(int argc, char **argv) {
     Options opt;
-    bool input_format_set = false;
-    bool yuyv_converter_set = false;
-    bool decoder_set = false;
-    bool v4l2_dmabuf_set = false;
+    OptionSetFlags flags;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config") {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                die("missing value for --config");
+            }
+            load_config_file(argv[++i], opt, flags);
+        }
+    }
+
     for (int i = 1; i < argc; ++i) {
         auto need_value = [&](const char *name) -> const char * {
             if (i + 1 >= argc) {
@@ -172,7 +348,8 @@ Options parse_args(int argc, char **argv) {
         };
 
         std::string arg = argv[i];
-        if (arg == "--device") opt.device = need_value("--device");
+        if (arg == "--config") (void)need_value("--config");
+        else if (arg == "--device") opt.device = need_value("--device");
         else if (arg == "--video-codec") opt.video_codec = need_value("--video-codec");
         else if (arg == "--audio-device") opt.audio_device = need_value("--audio-device");
         else if (arg == "--audio-codec") opt.audio_codec = need_value("--audio-codec");
@@ -183,21 +360,21 @@ Options parse_args(int argc, char **argv) {
         else if (arg == "--video-range") opt.video_range = need_value("--video-range");
         else if (arg == "--input-format") {
             opt.input_format = need_value("--input-format");
-            input_format_set = true;
+            flags.input_format = true;
         }
         else if (arg == "--yuyv-converter") {
             opt.yuyv_converter = need_value("--yuyv-converter");
-            yuyv_converter_set = true;
+            flags.yuyv_converter = true;
         }
         else if (arg == "--rga-library") opt.rga_library = need_value("--rga-library");
         else if (arg == "--no-audio") opt.audio = false;
         else if (arg == "--v4l2-dmabuf") {
             opt.v4l2_dmabuf = true;
-            v4l2_dmabuf_set = true;
+            flags.v4l2_dmabuf = true;
         }
         else if (arg == "--no-v4l2-dmabuf") {
             opt.v4l2_dmabuf = false;
-            v4l2_dmabuf_set = true;
+            flags.v4l2_dmabuf = true;
         }
         else if (arg == "--mppjpeg-copy-output" || arg == "--no-mppjpeg-zero-copy") {
             opt.mppjpeg_copy_output = true;
@@ -205,12 +382,13 @@ Options parse_args(int argc, char **argv) {
         else if (arg == "--output") opt.output = need_value("--output");
         else if (arg == "--listen-rtsp") opt.listen_rtsp = need_value("--listen-rtsp");
         else if (arg == "--rtsp-path") opt.rtsp_path = need_value("--rtsp-path");
+        else if (arg == "--rtsp-profile") opt.rtsp_profile_specs.push_back(need_value("--rtsp-profile"));
         else if (arg == "--rtsp-debug") opt.rtsp_debug = true;
         else if (arg == "--rtsp-idle-grace-ms") opt.rtsp_idle_grace_ms = atoi(need_value("--rtsp-idle-grace-ms"));
         else if (arg == "--max-clients") opt.max_clients = atoi(need_value("--max-clients"));
         else if (arg == "--decoder") {
             opt.decoder = need_value("--decoder");
-            decoder_set = true;
+            flags.decoder = true;
         }
         else if (arg == "--width") opt.width = atoi(need_value("--width"));
         else if (arg == "--height") opt.height = atoi(need_value("--height"));
@@ -227,32 +405,10 @@ Options parse_args(int argc, char **argv) {
         }
     }
 
-    if (env_truthy("RTSP_DEBUG")) opt.rtsp_debug = true;
-
     if (!opt.stream_profile.empty()) {
-        if (opt.stream_profile == "default" || opt.stream_profile == "recommended") {
-            opt.stream_profile = "mjpeg";
-        }
-
-        if (opt.stream_profile == "mjpeg") {
-            if (!input_format_set) opt.input_format = "mjpeg";
-            if (!yuyv_converter_set) opt.yuyv_converter = "libyuv";
-            if (!decoder_set) opt.decoder = "mppjpeg";
-            if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = true;
-        } else if (opt.stream_profile == "rga") {
-            if (!input_format_set) opt.input_format = "yuyv";
-            if (!yuyv_converter_set) opt.yuyv_converter = "rga";
-            if (!decoder_set) opt.decoder = "mppjpeg";
-            if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = true;
-        } else if (opt.stream_profile == "yuyv-libyuv" || opt.stream_profile == "libyuv") {
-            opt.stream_profile = "yuyv-libyuv";
-            if (!input_format_set) opt.input_format = "yuyv";
-            if (!yuyv_converter_set) opt.yuyv_converter = "libyuv";
-            if (!decoder_set) opt.decoder = "mppjpeg";
-            if (!v4l2_dmabuf_set) opt.v4l2_dmabuf = false;
-        } else {
-            die("--stream-profile must be mjpeg, rga, or yuyv-libyuv");
-        }
+        apply_stream_profile_defaults(opt, opt.stream_profile,
+                                      flags.input_format, flags.yuyv_converter,
+                                      flags.decoder, flags.v4l2_dmabuf);
     }
 
     if (opt.width <= 0 || opt.height <= 0 || opt.fps <= 0 || opt.bitrate <= 0 || opt.gop <= 0) {
@@ -619,14 +775,21 @@ public:
     }
 
     void cleanup() {
-        if (frame_) mpp_frame_deinit(&frame_);
+        for (auto &frame : frame_pool_) {
+            if (frame) mpp_frame_deinit(&frame);
+            frame = nullptr;
+        }
+        frame_pool_.clear();
         for (auto &b : capture_packet_bufs_) {
             if (b) mpp_buffer_put(b);
             b = nullptr;
         }
         capture_packet_bufs_.clear();
-        if (frame_buf_) mpp_buffer_put(frame_buf_);
-        frame_buf_ = nullptr;
+        for (auto &buf : frame_buf_pool_) {
+            if (buf) mpp_buffer_put(buf);
+            buf = nullptr;
+        }
+        frame_buf_pool_.clear();
         if (packet_buf_) mpp_buffer_put(packet_buf_);
         packet_buf_ = nullptr;
         if (buf_grp_) mpp_buffer_group_put(buf_grp_);
@@ -710,11 +873,14 @@ public:
     }
 
 private:
+    static constexpr size_t kFramePoolSize = 6;
+
     static int align16(int v) { return (v + 15) & ~15; }
 
     MppFrame decode_packet(MppPacket packet) {
+        MppFrame target = next_output_frame();
         MppMeta meta = mpp_packet_get_meta(packet);
-        if (meta) mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, frame_);
+        if (meta) mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, target);
 
         MPP_RET ret = mpi_->decode_put_packet(ctx_, packet);
         if (ret) {
@@ -727,7 +893,7 @@ private:
         mpp_packet_deinit(&packet);
         if (ret || !out) return nullptr;
 
-        if (out != frame_) {
+        if (out != target) {
             mpp_frame_deinit(&out);
             return nullptr;
         }
@@ -744,6 +910,13 @@ private:
         return out;
     }
 
+    MppFrame next_output_frame() {
+        if (frame_pool_.empty()) die("MPP JPEG frame pool is not initialized");
+        MppFrame frame = frame_pool_[next_frame_];
+        next_frame_ = (next_frame_ + 1) % frame_pool_.size();
+        return frame;
+    }
+
     void init() {
         if (mpp_buffer_group_get_internal(&buf_grp_, MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)) {
             die("mpp decoder buffer group init failed");
@@ -752,15 +925,23 @@ private:
         packet_buf_size_ = static_cast<size_t>(width_) * height_ * 3;
         size_t frame_buf_size = static_cast<size_t>(hor_stride_) * ver_stride_ * 4;
         if (mpp_buffer_get(buf_grp_, &packet_buf_, packet_buf_size_)) die("mpp decoder packet buffer failed");
-        if (mpp_buffer_get(buf_grp_, &frame_buf_, frame_buf_size)) die("mpp decoder frame buffer failed");
 
-        if (mpp_frame_init(&frame_)) die("mpp decoder frame init failed");
-        mpp_frame_set_width(frame_, width_);
-        mpp_frame_set_height(frame_, height_);
-        mpp_frame_set_hor_stride(frame_, hor_stride_);
-        mpp_frame_set_ver_stride(frame_, ver_stride_);
-        mpp_frame_set_fmt(frame_, MPP_FMT_YUV420SP);
-        mpp_frame_set_buffer(frame_, frame_buf_);
+        frame_buf_pool_.resize(kFramePoolSize, nullptr);
+        frame_pool_.resize(kFramePoolSize, nullptr);
+        for (size_t i = 0; i < kFramePoolSize; ++i) {
+            if (mpp_buffer_get(buf_grp_, &frame_buf_pool_[i], frame_buf_size)) {
+                die("mpp decoder frame buffer failed");
+            }
+            if (mpp_frame_init(&frame_pool_[i])) die("mpp decoder frame init failed");
+            mpp_frame_set_width(frame_pool_[i], width_);
+            mpp_frame_set_height(frame_pool_[i], height_);
+            mpp_frame_set_hor_stride(frame_pool_[i], hor_stride_);
+            mpp_frame_set_ver_stride(frame_pool_[i], ver_stride_);
+            mpp_frame_set_fmt(frame_pool_[i], MPP_FMT_YUV420SP);
+            mpp_frame_set_buffer(frame_pool_[i], frame_buf_pool_[i]);
+        }
+        fprintf(stderr, "mppjpeg output frame pool=%zu buffers stride=%d:%d\n",
+                frame_pool_.size(), hor_stride_, ver_stride_);
 
         if (mpp_create(&ctx_, &mpi_)) die("mpp decoder create failed");
         if (mpp_init(ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingMJPEG)) die("mpp jpeg decoder init failed");
@@ -830,8 +1011,9 @@ private:
     MppDecCfg cfg_ = nullptr;
     MppBufferGroup buf_grp_ = nullptr;
     MppBuffer packet_buf_ = nullptr;
-    MppBuffer frame_buf_ = nullptr;
-    MppFrame frame_ = nullptr;
+    std::vector<MppBuffer> frame_buf_pool_;
+    std::vector<MppFrame> frame_pool_;
+    size_t next_frame_ = 0;
     std::vector<MppBuffer> capture_packet_bufs_;
     uint64_t dmabuf_packets_ = 0;
     uint64_t copied_packets_ = 0;
@@ -1924,6 +2106,352 @@ private:
     std::thread thread_;
 };
 
+struct EncoderLayout {
+    int hor_stride = 0;
+    int ver_stride = 0;
+    MppFrameFormat fmt = MPP_FMT_YUV420P;
+    bool allocate_input = true;
+};
+
+struct RtspProfileOptions {
+    std::string name;
+    Options opt;
+};
+
+VideoCodec video_codec_from_options(const Options &opt) {
+    return opt.video_codec == "h265" ? VideoCodec::H265 : VideoCodec::H264;
+}
+
+EncoderLayout encoder_layout_for_options(const Options &opt) {
+    EncoderLayout layout{};
+    layout.hor_stride = opt.width;
+    layout.ver_stride = opt.height;
+    layout.fmt = MPP_FMT_YUV420P;
+    layout.allocate_input = true;
+
+    if (opt.input_format == "mjpeg" && opt.decoder == "mppjpeg") {
+        try {
+            MppJpegDecoder decoder(opt.width, opt.height);
+            layout.hor_stride = decoder.hor_stride();
+            layout.ver_stride = decoder.ver_stride();
+            layout.fmt = decoder.format();
+            layout.allocate_input = opt.mppjpeg_copy_output;
+        } catch (const std::exception &) {
+            layout.hor_stride = opt.width;
+            layout.ver_stride = opt.height;
+            layout.fmt = MPP_FMT_YUV420P;
+            layout.allocate_input = true;
+        }
+    } else if (opt.input_format == "yuyv") {
+        layout.hor_stride = (opt.width + 15) & ~15;
+        layout.ver_stride = (opt.height + 15) & ~15;
+        layout.fmt = MPP_FMT_YUV420SP;
+        layout.allocate_input = true;
+    }
+
+    return layout;
+}
+
+std::vector<uint8_t> make_video_header(const Options &opt) {
+    EncoderLayout layout = encoder_layout_for_options(opt);
+    MppVideoEncoder enc(opt, layout.hor_stride, layout.ver_stride,
+                        layout.fmt, layout.allocate_input);
+    std::vector<uint8_t> header;
+    enc.write_header([&](const uint8_t *data, size_t len) {
+        header.insert(header.end(), data, data + len);
+    });
+    return header;
+}
+
+class StreamPipeline {
+public:
+    explicit StreamPipeline(const Options &opt) : opt_(opt) {
+        cap_ = std::make_unique<V4L2Capture>(opt_);
+        cap_->open_device();
+
+        enc_hor_stride_ = opt_.width;
+        enc_ver_stride_ = opt_.height;
+        enc_fmt_ = MPP_FMT_YUV420P;
+        enc_alloc_input_ = true;
+
+        if (opt_.input_format == "mjpeg" && opt_.decoder == "mppjpeg") {
+            try {
+                mppjpeg_ = std::make_unique<MppJpegDecoder>(opt_.width, opt_.height);
+                if (opt_.v4l2_dmabuf) {
+                    mppjpeg_->init_capture_buffers(cap_->buffer_size(), 6);
+                }
+            } catch (const std::exception &e) {
+                fprintf(stderr,
+                        "warning: MPP JPEG decoder unavailable (%s); falling back to turbojpeg without V4L2 DMABUF\n",
+                        e.what());
+                mppjpeg_.reset();
+                opt_.decoder = "turbojpeg";
+                opt_.v4l2_dmabuf = false;
+                turbojpeg_ = std::make_unique<TurboJpegDecoder>(opt_.width, opt_.height);
+            }
+            if (mppjpeg_) {
+                enc_hor_stride_ = mppjpeg_->hor_stride();
+                enc_ver_stride_ = mppjpeg_->ver_stride();
+                enc_fmt_ = mppjpeg_->format();
+                enc_alloc_input_ = opt_.mppjpeg_copy_output;
+                if (opt_.mppjpeg_copy_output) {
+                    fprintf(stderr,
+                            "mppjpeg copy-output mode enabled: decoder output is copied into encoder-owned dma-buf\n");
+                }
+            }
+        } else if (opt_.input_format == "mjpeg") {
+            if (opt_.v4l2_dmabuf) die("--v4l2-dmabuf requires --decoder mppjpeg");
+            turbojpeg_ = std::make_unique<TurboJpegDecoder>(opt_.width, opt_.height);
+        } else {
+            enc_hor_stride_ = (opt_.width + 15) & ~15;
+            enc_ver_stride_ = (opt_.height + 15) & ~15;
+            enc_fmt_ = MPP_FMT_YUV420SP;
+            enc_alloc_input_ = true;
+            if (opt_.yuyv_converter == "rga") {
+                yuyv_rga_capture_pool_ = std::make_unique<MppDmabufPool>(cap_->buffer_size(), 6);
+            }
+        }
+
+        enc_ = std::make_unique<MppVideoEncoder>(opt_, enc_hor_stride_, enc_ver_stride_,
+                                                 enc_fmt_, enc_alloc_input_);
+
+        if (opt_.input_format == "yuyv" && opt_.yuyv_converter == "rga") {
+            if (!yuyv_rga_capture_pool_) die("RGA capture dma-buf pool was not initialized");
+            RgaConverterConfig rga_cfg{};
+            rga_cfg.library_path = opt_.rga_library;
+            rga_cfg.width = opt_.width;
+            rga_cfg.height = opt_.height;
+            rga_cfg.src_stride_bytes = static_cast<int>(cap_->bytesperline());
+            rga_cfg.dst_hor_stride = enc_hor_stride_;
+            rga_cfg.dst_ver_stride = enc_ver_stride_;
+            rga_cfg.dst_fd = enc_->input_buffer_fd();
+            rga_cfg.dst_size = enc_->input_buffer_size();
+            yuyv_rga_ = std::make_unique<RgaYuyvToNv12Converter>(rga_cfg,
+                                                                  yuyv_rga_capture_pool_->buffers());
+            fprintf(stderr, "YUYV converter: RGA dma-buf path enabled\n");
+        }
+
+        enc_->write_header([&](const uint8_t *data, size_t len) {
+            video_header_.insert(video_header_.end(), data, data + len);
+        });
+    }
+
+    ~StreamPipeline() {
+        stop();
+    }
+
+    const Options &options() const { return opt_; }
+    const std::vector<uint8_t> &video_header() const { return video_header_; }
+
+    void start() {
+        if (started_) return;
+        const std::vector<MppBuffer> *capture_buffers = nullptr;
+        if (opt_.input_format == "mjpeg" && opt_.v4l2_dmabuf) {
+            capture_buffers = &mppjpeg_->capture_buffers();
+        } else if (opt_.input_format == "yuyv" && opt_.yuyv_converter == "rga") {
+            capture_buffers = &yuyv_rga_capture_pool_->buffers();
+        }
+        cap_->start(capture_buffers);
+        started_ = true;
+    }
+
+    void stop() {
+        if (!started_) return;
+        cap_->stop();
+        started_ = false;
+    }
+
+    void request_idr() {
+        enc_->request_idr();
+    }
+
+    template <typename PacketWriter, typename TimestampFn>
+    bool read_frame(PacketWriter writer,
+                    TimestampFn timestamp_fn,
+                    int &stats_captured,
+                    int &stats_skipped) {
+        bool encoded = false;
+        cap_->read_frame([&](const CapturedFrame &captured_frame) {
+            ++stats_captured;
+            uint32_t video_rtp_timestamp = timestamp_fn(captured_frame.timestamp_ns);
+            auto frame_writer = [&](EncodedPacket packet) {
+                packet.rtp_timestamp = video_rtp_timestamp;
+                packet.has_rtp_timestamp = true;
+                writer(packet);
+            };
+            if (opt_.input_format == "yuyv") {
+                if (opt_.yuyv_converter == "rga") {
+                    yuyv_rga_->convert(captured_frame);
+                    enc_->submit_nv12_frame(frame_writer);
+                } else {
+                    enc_->encode_yuyv_as_nv12(captured_frame.data,
+                                               captured_frame.bytesused,
+                                               captured_frame.bytesperline,
+                                               frame_writer);
+                }
+            } else if (opt_.decoder == "mppjpeg") {
+                MppFrame frame = mppjpeg_->decode_to_frame(captured_frame);
+                if (!frame) {
+                    ++stats_skipped;
+                    if (stats_skipped <= 10 || stats_skipped % opt_.fps == 0) {
+                        fprintf(stderr, "skipped corrupt/unsupported MJPEG frame captured=%d skipped=%d\n",
+                                stats_captured, stats_skipped);
+                    }
+                    return;
+                }
+                if (opt_.mppjpeg_copy_output) {
+                    enc_->encode_mpp_frame_copy_nv12(frame, frame_writer);
+                } else {
+                    enc_->encode_mpp_frame(frame, frame_writer);
+                }
+            } else {
+                const uint8_t *i420 = turbojpeg_->decode_to_i420(captured_frame.data,
+                                                                 captured_frame.bytesused);
+                if (!i420) {
+                    ++stats_skipped;
+                    if (stats_skipped <= 10 || stats_skipped % opt_.fps == 0) {
+                        fprintf(stderr, "skipped corrupt/unsupported MJPEG frame captured=%d skipped=%d\n",
+                                stats_captured, stats_skipped);
+                    }
+                    return;
+                }
+                enc_->encode_i420(i420, frame_writer);
+            }
+            encoded = true;
+        });
+        return encoded;
+    }
+
+private:
+    Options opt_;
+    std::unique_ptr<V4L2Capture> cap_;
+    std::unique_ptr<TurboJpegDecoder> turbojpeg_;
+    std::unique_ptr<MppJpegDecoder> mppjpeg_;
+    std::unique_ptr<MppDmabufPool> yuyv_rga_capture_pool_;
+    std::unique_ptr<MppVideoEncoder> enc_;
+    std::unique_ptr<RgaYuyvToNv12Converter> yuyv_rga_;
+    std::vector<uint8_t> video_header_;
+    int enc_hor_stride_ = 0;
+    int enc_ver_stride_ = 0;
+    MppFrameFormat enc_fmt_ = MPP_FMT_YUV420P;
+    bool enc_alloc_input_ = true;
+    bool started_ = false;
+};
+
+std::string trim_copy(const std::string &s) {
+    size_t begin = 0;
+    while (begin < s.size() && isspace(static_cast<unsigned char>(s[begin]))) ++begin;
+    size_t end = s.size();
+    while (end > begin && isspace(static_cast<unsigned char>(s[end - 1]))) --end;
+    return s.substr(begin, end - begin);
+}
+
+void validate_profile_options(const Options &opt) {
+    if (opt.width <= 0 || opt.height <= 0 || opt.fps <= 0 || opt.bitrate <= 0 || opt.gop <= 0) {
+        die("invalid numeric option in RTSP profile");
+    }
+    if (opt.input_format != "mjpeg" && opt.input_format != "yuyv") {
+        die("RTSP profile input-format must be mjpeg or yuyv");
+    }
+    if (opt.yuyv_converter != "libyuv" && opt.yuyv_converter != "rga") {
+        die("RTSP profile yuyv-converter must be libyuv or rga");
+    }
+    if (opt.yuyv_converter == "rga" && opt.input_format != "yuyv") {
+        die("RTSP profile yuyv-converter=rga requires input-format=yuyv");
+    }
+    if (opt.decoder != "mppjpeg" && opt.decoder != "turbojpeg") {
+        die("RTSP profile decoder must be mppjpeg or turbojpeg");
+    }
+    if (opt.video_codec != "h264" && opt.video_codec != "h265") {
+        die("RTSP profile codec must be h264 or h265");
+    }
+    if (opt.video_range != "full" && opt.video_range != "limited" && opt.video_range != "unspecified") {
+        die("RTSP profile video-range must be full, limited, or unspecified");
+    }
+    if (opt.audio_codec != "l16" && opt.audio_codec != "opus") {
+        die("RTSP profile audio-codec must be l16 or opus");
+    }
+#ifndef HAVE_OPUS
+    if (opt.audio_codec == "opus") {
+        die("RTSP profile requested opus audio but this binary was built without libopus");
+    }
+#endif
+#ifndef HAVE_RGA
+    if (opt.yuyv_converter == "rga") {
+        die("RTSP profile requested RGA but this binary was built without librga");
+    }
+#endif
+}
+
+RtspProfileOptions parse_rtsp_profile_spec(const Options &base, const std::string &spec) {
+    RtspProfileOptions profile{"", base};
+    profile.opt.frames = 0;
+
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t end = spec.find(',', start);
+        std::string part = trim_copy(spec.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (!part.empty()) {
+            size_t eq = part.find('=');
+            if (eq == std::string::npos) die("--rtsp-profile entries must be key=value: " + part);
+            std::string key = trim_copy(part.substr(0, eq));
+            std::string value = trim_copy(part.substr(eq + 1));
+            if (key == "name") profile.name = value;
+            else if (key == "path") profile.opt.rtsp_path = value;
+            else if (key == "width") profile.opt.width = atoi(value.c_str());
+            else if (key == "height") profile.opt.height = atoi(value.c_str());
+            else if (key == "fps") profile.opt.fps = atoi(value.c_str());
+            else if (key == "bitrate") profile.opt.bitrate = atoi(value.c_str());
+            else if (key == "gop") profile.opt.gop = atoi(value.c_str());
+            else if (key == "codec" || key == "video-codec") {
+                profile.opt.video_codec = value == "hevc" ? "h265" : value;
+            } else if (key == "stream-profile" || key == "profile") {
+                apply_stream_profile_defaults(profile.opt, value, false, false, false, false);
+            } else if (key == "audio") profile.opt.audio = parse_bool_value(value);
+            else if (key == "audio-codec") profile.opt.audio_codec = value;
+            else if (key == "audio-frame-ms") profile.opt.audio_frame_frames = parse_audio_frame_ms(value.c_str());
+            else if (key == "input-format") {
+                profile.opt.input_format = value == "yuy2" ? "yuyv" : value;
+            } else if (key == "yuyv-converter") profile.opt.yuyv_converter = value;
+            else if (key == "decoder") profile.opt.decoder = value;
+            else if (key == "video-range") profile.opt.video_range = value;
+            else if (key == "v4l2-dmabuf") profile.opt.v4l2_dmabuf = parse_bool_value(value);
+            else if (key == "mppjpeg-copy-output") profile.opt.mppjpeg_copy_output = parse_bool_value(value);
+            else die("unknown --rtsp-profile key: " + key);
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+
+    if (profile.opt.rtsp_path.empty()) die("--rtsp-profile requires path=/name");
+    if (profile.opt.rtsp_path[0] != '/') profile.opt.rtsp_path.insert(profile.opt.rtsp_path.begin(), '/');
+    if (profile.name.empty()) {
+        profile.name = profile.opt.rtsp_path == "/" ? "root" : profile.opt.rtsp_path.substr(1);
+    }
+    if (profile.opt.input_format == "yuyv" && profile.opt.yuyv_converter == "rga") {
+        profile.opt.v4l2_dmabuf = true;
+    }
+    validate_profile_options(profile.opt);
+    return profile;
+}
+
+std::vector<RtspProfileOptions> build_rtsp_profiles(const Options &base) {
+    std::vector<RtspProfileOptions> profiles;
+    profiles.push_back(RtspProfileOptions{"capture", base});
+    profiles[0].opt.frames = 0;
+
+    for (const std::string &spec : base.rtsp_profile_specs) {
+        RtspProfileOptions profile = parse_rtsp_profile_spec(base, spec);
+        for (const auto &existing : profiles) {
+            if (existing.opt.rtsp_path == profile.opt.rtsp_path) {
+                die("duplicate RTSP profile path: " + profile.opt.rtsp_path);
+            }
+        }
+        profiles.push_back(std::move(profile));
+    }
+    return profiles;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1941,79 +2469,6 @@ int main(int argc, char **argv) {
                 opt.video_codec.c_str(),
                 opt.bitrate, opt.output.c_str());
 
-        std::unique_ptr<TurboJpegDecoder> turbojpeg;
-        std::unique_ptr<MppJpegDecoder> mppjpeg;
-        std::unique_ptr<MppDmabufPool> yuyv_rga_capture_pool;
-        V4L2Capture cap(opt);
-        cap.open_device();
-
-        int enc_hor_stride = opt.width;
-        int enc_ver_stride = opt.height;
-        MppFrameFormat enc_fmt = MPP_FMT_YUV420P;
-        bool enc_alloc_input = true;
-
-        if (opt.input_format == "mjpeg" && opt.decoder == "mppjpeg") {
-            try {
-                mppjpeg = std::make_unique<MppJpegDecoder>(opt.width, opt.height);
-                if (opt.v4l2_dmabuf) {
-                    mppjpeg->init_capture_buffers(cap.buffer_size(), 6);
-                }
-            } catch (const std::exception &e) {
-                fprintf(stderr,
-                        "warning: MPP JPEG decoder unavailable (%s); falling back to turbojpeg without V4L2 DMABUF\n",
-                        e.what());
-                mppjpeg.reset();
-                opt.decoder = "turbojpeg";
-                opt.v4l2_dmabuf = false;
-                turbojpeg = std::make_unique<TurboJpegDecoder>(opt.width, opt.height);
-            }
-            if (mppjpeg) {
-                enc_hor_stride = mppjpeg->hor_stride();
-                enc_ver_stride = mppjpeg->ver_stride();
-                enc_fmt = mppjpeg->format();
-                enc_alloc_input = opt.mppjpeg_copy_output;
-                if (opt.mppjpeg_copy_output) {
-                    fprintf(stderr,
-                            "mppjpeg copy-output mode enabled: decoder output is copied into encoder-owned dma-buf\n");
-                }
-            }
-        } else if (opt.input_format == "mjpeg") {
-            if (opt.v4l2_dmabuf) die("--v4l2-dmabuf requires --decoder mppjpeg");
-            turbojpeg = std::make_unique<TurboJpegDecoder>(opt.width, opt.height);
-        } else {
-            enc_hor_stride = (opt.width + 15) & ~15;
-            enc_ver_stride = (opt.height + 15) & ~15;
-            enc_fmt = MPP_FMT_YUV420SP;
-            enc_alloc_input = true;
-            if (opt.yuyv_converter == "rga") {
-                yuyv_rga_capture_pool = std::make_unique<MppDmabufPool>(cap.buffer_size(), 6);
-            }
-        }
-
-        MppVideoEncoder enc(opt, enc_hor_stride, enc_ver_stride, enc_fmt, enc_alloc_input);
-
-        std::unique_ptr<RgaYuyvToNv12Converter> yuyv_rga;
-        if (opt.input_format == "yuyv" && opt.yuyv_converter == "rga") {
-            if (!yuyv_rga_capture_pool) die("RGA capture dma-buf pool was not initialized");
-            RgaConverterConfig rga_cfg{};
-            rga_cfg.library_path = opt.rga_library;
-            rga_cfg.width = opt.width;
-            rga_cfg.height = opt.height;
-            rga_cfg.src_stride_bytes = static_cast<int>(cap.bytesperline());
-            rga_cfg.dst_hor_stride = enc_hor_stride;
-            rga_cfg.dst_ver_stride = enc_ver_stride;
-            rga_cfg.dst_fd = enc.input_buffer_fd();
-            rga_cfg.dst_size = enc.input_buffer_size();
-            yuyv_rga = std::make_unique<RgaYuyvToNv12Converter>(rga_cfg,
-                                                                yuyv_rga_capture_pool->buffers());
-            fprintf(stderr, "YUYV converter: RGA dma-buf path enabled\n");
-        }
-
-        std::vector<uint8_t> video_header;
-        enc.write_header([&](const uint8_t *data, size_t len) {
-            video_header.insert(video_header.end(), data, data + len);
-        });
-
         const bool serve_rtsp = !opt.listen_rtsp.empty();
         const bool publish_rtsp = !serve_rtsp && starts_with(opt.output, "rtsp://");
         std::unique_ptr<Output> out;
@@ -2022,34 +2477,60 @@ int main(int argc, char **argv) {
         MediaOutput *media_output = nullptr;
         std::unique_ptr<AlsaAudioCapture> audio;
         AudioRuntime audio_runtime;
+        std::unique_ptr<StreamPipeline> pipeline;
+        std::vector<RtspProfileOptions> rtsp_profiles;
+        int pipeline_profile_index = -1;
+        bool rtsp_audio_started = false;
+
         if (serve_rtsp) {
-            VideoCodec codec = opt.video_codec == "h265" ? VideoCodec::H265 : VideoCodec::H264;
-            rtsp_server = std::make_unique<RtspServer>(opt.listen_rtsp, opt.rtsp_path, codec, video_header,
-                                                       opt.fps, opt.audio, opt.audio_codec,
-                                                       opt.rtp_payload_size, opt.audio_frame_frames,
-                                                       opt.rtsp_debug,
+            rtsp_profiles = build_rtsp_profiles(opt);
+            std::vector<RtspServer::StreamProfile> server_profiles;
+            server_profiles.reserve(rtsp_profiles.size());
+            for (const auto &profile_opt : rtsp_profiles) {
+                Options header_opt = profile_opt.opt;
+                RtspServer::StreamProfile profile;
+                profile.name = profile_opt.name;
+                profile.path = profile_opt.opt.rtsp_path;
+                profile.video_codec = video_codec_from_options(profile_opt.opt);
+                profile.video_header_provider = [header_opt] { return make_video_header(header_opt); };
+                profile.fps = profile_opt.opt.fps;
+                profile.audio = profile_opt.opt.audio;
+                profile.audio_codec = profile_opt.opt.audio_codec;
+                profile.audio_frame_frames = profile_opt.opt.audio_frame_frames;
+                server_profiles.push_back(std::move(profile));
+                fprintf(stderr, "rtsp profile %s path=%s %dx%d@%d codec=%s bitrate=%d\n",
+                        profile_opt.name.c_str(), profile_opt.opt.rtsp_path.c_str(),
+                        profile_opt.opt.width, profile_opt.opt.height, profile_opt.opt.fps,
+                        profile_opt.opt.video_codec.c_str(), profile_opt.opt.bitrate);
+            }
+            rtsp_server = std::make_unique<RtspServer>(opt.listen_rtsp, std::move(server_profiles),
+                                                       opt.rtp_payload_size, opt.rtsp_debug,
                                                        opt.max_clients);
             media_output = rtsp_server.get();
-        } else if (publish_rtsp) {
-            if (opt.video_codec != "h264") {
-                die("--output rtsp:// publisher mode currently supports only --video-codec h264");
-            }
-            rtsp = std::make_unique<RtspPublisher>(opt.output, video_header, opt.fps, opt.audio,
-                                                   opt.audio_codec, opt.rtp_payload_size);
-            media_output = rtsp.get();
-            if (opt.audio) {
-                audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec,
-                                                           opt.audio_gain, opt.audio_frame_frames);
-                audio_runtime.start(*audio, *media_output);
-                fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s frame_ms=%.1f gain=%.2f\n",
-                        opt.audio_device.c_str(), opt.audio_codec.c_str(),
-                        static_cast<double>(opt.audio_frame_frames) / 48.0, opt.audio_gain);
-            }
         } else {
-            out = std::make_unique<Output>(opt.output);
-            out->write(video_header.data(), video_header.size());
-            if (opt.audio) {
-                fprintf(stderr, "audio ignored for raw video output; use --listen-rtsp to serve audio\n");
+            pipeline = std::make_unique<StreamPipeline>(opt);
+            const std::vector<uint8_t> &video_header = pipeline->video_header();
+            if (publish_rtsp) {
+                if (opt.video_codec != "h264") {
+                    die("--output rtsp:// publisher mode currently supports only --video-codec h264");
+                }
+                rtsp = std::make_unique<RtspPublisher>(opt.output, video_header, opt.fps, opt.audio,
+                                                       opt.audio_codec, opt.rtp_payload_size);
+                media_output = rtsp.get();
+                if (opt.audio) {
+                    audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec,
+                                                               opt.audio_gain, opt.audio_frame_frames);
+                    audio_runtime.start(*audio, *media_output);
+                    fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s frame_ms=%.1f gain=%.2f\n",
+                            opt.audio_device.c_str(), opt.audio_codec.c_str(),
+                            static_cast<double>(opt.audio_frame_frames) / 48.0, opt.audio_gain);
+                }
+            } else {
+                out = std::make_unique<Output>(opt.output);
+                out->write(video_header.data(), video_header.size());
+                if (opt.audio) {
+                    fprintf(stderr, "audio ignored for raw video output; use --listen-rtsp to serve audio\n");
+                }
             }
         }
 
@@ -2062,17 +2543,8 @@ int main(int argc, char **argv) {
         uint64_t capture_time_base_ns = 0;
         uint32_t last_video_rtp_timestamp = 0;
         bool have_video_rtp_timestamp = false;
-        bool capture_started = false;
-        auto start_capture = [&]() {
-            if (capture_started) return;
-            const std::vector<MppBuffer> *capture_buffers = nullptr;
-            if (opt.input_format == "mjpeg" && opt.v4l2_dmabuf) {
-                capture_buffers = &mppjpeg->capture_buffers();
-            } else if (opt.input_format == "yuyv" && opt.yuyv_converter == "rga") {
-                capture_buffers = &yuyv_rga_capture_pool->buffers();
-            }
-            cap.start(capture_buffers);
-            capture_started = true;
+
+        auto reset_stream_stats = [&]() {
             stats_encoded = 0;
             stats_captured = 0;
             stats_skipped = 0;
@@ -2080,25 +2552,71 @@ int main(int argc, char **argv) {
             capture_time_base_ns = 0;
             last_video_rtp_timestamp = 0;
             have_video_rtp_timestamp = false;
-            if (serve_rtsp && opt.audio) {
-                audio = std::make_unique<AlsaAudioCapture>(opt.audio_device, opt.audio_codec,
-                                                           opt.audio_gain, opt.audio_frame_frames);
-                audio_runtime.start(*audio, *media_output);
-                fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s frame_ms=%.1f gain=%.2f\n",
-                        opt.audio_device.c_str(), opt.audio_codec.c_str(),
-                        static_cast<double>(opt.audio_frame_frames) / 48.0, opt.audio_gain);
+        };
+
+        auto stop_rtsp_audio = [&]() {
+            if (rtsp_audio_started) {
+                audio_runtime.stop();
+                rtsp_audio_started = false;
+            }
+            if (serve_rtsp) audio.reset();
+        };
+
+        auto start_rtsp_audio = [&](const Options &active_opt) {
+            if (!serve_rtsp || !active_opt.audio || rtsp_audio_started) return;
+            audio = std::make_unique<AlsaAudioCapture>(active_opt.audio_device, active_opt.audio_codec,
+                                                       active_opt.audio_gain, active_opt.audio_frame_frames);
+            audio_runtime.start(*audio, *media_output);
+            rtsp_audio_started = true;
+            fprintf(stderr, "audio=%s PCM S16_LE 48000Hz stereo -> RTP %s frame_ms=%.1f gain=%.2f\n",
+                    active_opt.audio_device.c_str(), active_opt.audio_codec.c_str(),
+                    static_cast<double>(active_opt.audio_frame_frames) / 48.0, active_opt.audio_gain);
+        };
+
+        auto start_pipeline = [&](int profile_index) {
+            if (serve_rtsp) {
+                if (profile_index < 0 || profile_index >= static_cast<int>(rtsp_profiles.size())) {
+                    die("invalid active RTSP profile index");
+                }
+                if (pipeline_profile_index == profile_index) {
+                    start_rtsp_audio(rtsp_profiles[static_cast<size_t>(profile_index)].opt);
+                    return;
+                }
+                stop_rtsp_audio();
+                if (pipeline) {
+                    pipeline->stop();
+                    pipeline.reset();
+                }
+                const RtspProfileOptions &profile = rtsp_profiles[static_cast<size_t>(profile_index)];
+                fprintf(stderr, "starting rtsp profile %s path=%s %dx%d@%d codec=%s bitrate=%d\n",
+                        profile.name.c_str(), profile.opt.rtsp_path.c_str(),
+                        profile.opt.width, profile.opt.height, profile.opt.fps,
+                        profile.opt.video_codec.c_str(), profile.opt.bitrate);
+                pipeline = std::make_unique<StreamPipeline>(profile.opt);
+                pipeline_profile_index = profile_index;
+                reset_stream_stats();
+                pipeline->start();
+                start_rtsp_audio(profile.opt);
+                return;
+            }
+            if (!pipeline) die("video pipeline is not initialized");
+            pipeline->start();
+        };
+
+        auto stop_pipeline = [&]() {
+            if (serve_rtsp) stop_rtsp_audio();
+            else audio_runtime.stop();
+            if (pipeline) pipeline->stop();
+            if (serve_rtsp) {
+                pipeline.reset();
+                pipeline_profile_index = -1;
             }
         };
 
-        auto stop_capture = [&]() {
-            if (!capture_started) return;
-            audio_runtime.stop();
-            if (serve_rtsp) audio.reset();
-            cap.stop();
-            capture_started = false;
-        };
-
-        if (!serve_rtsp) start_capture();
+        if (!serve_rtsp) {
+            start_pipeline(-1);
+            reset_stream_stats();
+        }
 
         auto writer = [&](const EncodedPacket &packet) {
             if (serve_rtsp || publish_rtsp) media_output->write_packet(packet);
@@ -2106,6 +2624,7 @@ int main(int argc, char **argv) {
         };
 
         auto capture_rtp_timestamp = [&](uint64_t timestamp_ns) -> uint32_t {
+            int active_fps = pipeline ? pipeline->options().fps : opt.fps;
             if (timestamp_ns == 0) timestamp_ns = monotonic_time_ns();
             if (capture_time_base_ns == 0 || timestamp_ns < capture_time_base_ns) {
                 capture_time_base_ns = timestamp_ns;
@@ -2117,7 +2636,7 @@ int main(int argc, char **argv) {
             uint64_t ts64 = (delta_ns * 90000ULL + 500000000ULL) / 1000000000ULL;
             uint32_t ts = static_cast<uint32_t>(ts64);
             if (have_video_rtp_timestamp && ts <= last_video_rtp_timestamp) {
-                ts = last_video_rtp_timestamp + static_cast<uint32_t>(std::max(1, 90000 / opt.fps));
+                ts = last_video_rtp_timestamp + static_cast<uint32_t>(std::max(1, 90000 / active_fps));
             }
             last_video_rtp_timestamp = ts;
             have_video_rtp_timestamp = true;
@@ -2126,7 +2645,7 @@ int main(int argc, char **argv) {
 
         while (opt.frames == 0 || total_encoded < opt.frames) {
             if (serve_rtsp && !rtsp_server->has_clients()) {
-                if (capture_started && opt.rtsp_idle_grace_ms > 0) {
+                if (pipeline && opt.rtsp_idle_grace_ms > 0) {
                     auto now = std::chrono::steady_clock::now();
                     if (no_clients_since == std::chrono::steady_clock::time_point::min()) {
                         no_clients_since = now;
@@ -2137,80 +2656,46 @@ int main(int argc, char **argv) {
                         continue;
                     }
                 }
-                stop_capture();
+                stop_pipeline();
                 no_clients_since = std::chrono::steady_clock::time_point::min();
                 rtsp_server->wait_for_clients(std::chrono::milliseconds(500));
                 continue;
             }
             no_clients_since = std::chrono::steady_clock::time_point::min();
-            if (serve_rtsp) start_capture();
+            if (serve_rtsp) {
+                int requested_profile = rtsp_server->active_profile_index();
+                if (requested_profile < 0) {
+                    rtsp_server->wait_for_clients(std::chrono::milliseconds(100));
+                    continue;
+                }
+                start_pipeline(requested_profile);
+            }
 
-            cap.read_frame([&](const CapturedFrame &captured_frame) {
-                ++stats_captured;
-                if (serve_rtsp && rtsp_server->consume_keyframe_request()) {
-                    enc.request_idr();
+            if (serve_rtsp && rtsp_server->consume_keyframe_request()) {
+                pipeline->request_idr();
+            }
+
+            bool encoded = pipeline->read_frame(writer, capture_rtp_timestamp,
+                                                stats_captured, stats_skipped);
+            if (!encoded) continue;
+
+            ++total_encoded;
+            ++stats_encoded;
+            const Options &active_opt = pipeline->options();
+            if (stats_encoded % active_opt.fps == 0) {
+                auto now = std::chrono::steady_clock::now();
+                double secs = std::chrono::duration<double>(now - stats_start).count();
+                fprintf(stderr, "captured=%d encoded=%d skipped=%d avg_encoded_fps=%.2f\n",
+                        stats_captured, stats_encoded, stats_skipped,
+                        stats_encoded / std::max(secs, 0.001));
+                if ((serve_rtsp || publish_rtsp) && stats_encoded % (active_opt.fps * 5) == 0) {
+                    media_output->log_stats();
                 }
-                uint32_t video_rtp_timestamp = capture_rtp_timestamp(captured_frame.timestamp_ns);
-                auto frame_writer = [&](EncodedPacket packet) {
-                    packet.rtp_timestamp = video_rtp_timestamp;
-                    packet.has_rtp_timestamp = true;
-                    writer(packet);
-                };
-                if (opt.input_format == "yuyv") {
-                    if (opt.yuyv_converter == "rga") {
-                        yuyv_rga->convert(captured_frame);
-                        enc.submit_nv12_frame(frame_writer);
-                    } else {
-                        enc.encode_yuyv_as_nv12(captured_frame.data,
-                                                captured_frame.bytesused,
-                                                captured_frame.bytesperline,
-                                                frame_writer);
-                    }
-                } else if (opt.decoder == "mppjpeg") {
-                    MppFrame frame = mppjpeg->decode_to_frame(captured_frame);
-                    if (!frame) {
-                        ++stats_skipped;
-                        if (stats_skipped <= 10 || stats_skipped % opt.fps == 0) {
-                            fprintf(stderr, "skipped corrupt/unsupported MJPEG frame captured=%d skipped=%d\n",
-                                    stats_captured, stats_skipped);
-                        }
-                        return;
-                    }
-                    if (opt.mppjpeg_copy_output) {
-                        enc.encode_mpp_frame_copy_nv12(frame, frame_writer);
-                    } else {
-                        enc.encode_mpp_frame(frame, frame_writer);
-                    }
-                } else {
-                    const uint8_t *i420 = turbojpeg->decode_to_i420(captured_frame.data,
-                                                                    captured_frame.bytesused);
-                    if (!i420) {
-                        ++stats_skipped;
-                        if (stats_skipped <= 10 || stats_skipped % opt.fps == 0) {
-                            fprintf(stderr, "skipped corrupt/unsupported MJPEG frame captured=%d skipped=%d\n",
-                                    stats_captured, stats_skipped);
-                        }
-                        return;
-                    }
-                    enc.encode_i420(i420, frame_writer);
-                }
-                ++total_encoded;
-                ++stats_encoded;
-                if (stats_encoded % opt.fps == 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    double secs = std::chrono::duration<double>(now - stats_start).count();
-                    fprintf(stderr, "captured=%d encoded=%d skipped=%d avg_encoded_fps=%.2f\n",
-                            stats_captured, stats_encoded, stats_skipped,
-                            stats_encoded / std::max(secs, 0.001));
-                    if ((serve_rtsp || publish_rtsp) && stats_encoded % (opt.fps * 5) == 0) {
-                        media_output->log_stats();
-                    }
-                }
-            });
+            }
         }
 
         audio_runtime.stop();
-        cap.stop();
+        if (pipeline) pipeline->stop();
 
         return 0;
     } catch (const std::exception &e) {

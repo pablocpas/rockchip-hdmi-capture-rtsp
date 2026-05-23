@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+## v0.2.2
+
 - Added experimental `--video-codec h265` direct RTSP support using Rockchip
   MPP HEVC encoding and RTP/H.265 packetization.
+- Hardened H.265 RTP packetization for VLC compatibility.
+- Added configurable video color range to avoid washed-out black levels.
+- Added explicit INI-based RTSP profiles and an MPP JPEG decoder frame pool.
+- Improved direct RTSP behavior for slow/mobile clients with frame-aware per-client
+  queues, bounded backlog, non-blocking TCP writes, and keyframe resync after drops.
 - Kept H.264 as the default video codec.
 
 ## v0.2.0

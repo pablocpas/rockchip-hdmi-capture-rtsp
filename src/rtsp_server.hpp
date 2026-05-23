@@ -1,6 +1,7 @@
 #pragma once
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdint.h>
@@ -202,7 +203,11 @@ public:
             size_t offset = static_cast<size_t>(nals[i].data - storage.data);
             add_video_nal(profile, chunks, storage, timestamp, offset, nals[i].size, i == last_payload_nal);
         }
-        broadcast(chunks);
+        RtpFrame frame;
+        frame.chunks = std::move(chunks);
+        frame.video = true;
+        frame.keyframe = is_video_keyframe(profile, nals);
+        broadcast(frame);
         if (packet.has_rtp_timestamp) {
             video_timestamp_.store(timestamp, std::memory_order_relaxed);
         } else {
@@ -231,7 +236,9 @@ public:
         chunk.storage.size = payload->size();
         chunk.offset = 0;
         chunk.size = payload->size();
-        broadcast(std::vector<RtpChunk>{chunk});
+        RtpFrame frame;
+        frame.chunks.push_back(std::move(chunk));
+        broadcast(frame);
     }
 
     void write_audio_payload(const uint8_t *payload, size_t len, size_t frames) override {
@@ -247,7 +254,9 @@ public:
         chunk.storage.size = data->size();
         chunk.offset = 0;
         chunk.size = data->size();
-        broadcast(std::vector<RtpChunk>{chunk});
+        RtpFrame frame;
+        frame.chunks.push_back(std::move(chunk));
+        broadcast(frame);
     }
 
     void log_stats() override {
@@ -319,12 +328,29 @@ private:
         size_t wire_size() const { return 4 + 12 + payload_size(); }
     };
 
+    struct RtpFrame {
+        std::vector<RtpChunk> chunks;
+        bool video = false;
+        bool keyframe = false;
+
+        size_t wire_size() const {
+            size_t total = 0;
+            for (const auto &chunk : chunks) total += chunk.wire_size();
+            return total;
+        }
+
+        size_t packet_count() const { return chunks.size(); }
+        uint32_t timestamp() const { return chunks.empty() ? 0 : chunks.front().timestamp; }
+    };
+
     class Session : public std::enable_shared_from_this<Session> {
     public:
         Session(RtspServer &server, int fd, uint64_t id)
             : server_(server), fd_(fd), id_(id) {
             int yes = 1;
             setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+            int flags = fcntl(fd_, F_GETFL, 0);
+            if (flags >= 0) fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
             cname_ = "rk-hdmi-streamer-" + std::to_string(id_);
             reset_track_for_new_epoch(video_track_, 0, 1);
             reset_track_for_new_epoch(audio_track_, 2, 3);
@@ -356,45 +382,66 @@ private:
         bool playing() const { return playing_.load(std::memory_order_relaxed); }
         uint64_t id() const { return id_; }
 
-        void enqueue(const std::vector<RtpChunk> &chunks) {
+        void enqueue(const RtpFrame &frame) {
             if (!playing() || closed()) return;
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            std::vector<const RtpChunk *> accepted;
-            accepted.reserve(chunks.size());
-            size_t frame_bytes = 0;
-            for (const auto &chunk : chunks) {
-                if (chunk.channel == 0 && !video_track_.setup) continue;
-                if (chunk.channel == 2 && !audio_track_.setup) continue;
-                size_t bytes = chunk.wire_size();
-                if (bytes > max_queue_bytes_) continue;
-                accepted.push_back(&chunk);
-                frame_bytes += bytes;
+            if (frame.chunks.empty()) return;
+            if (frame.video && !video_track_.setup) return;
+            if (!frame.video && !audio_track_.setup) return;
+
+            RtpFrame parameter_sets;
+            if (frame.video && frame.keyframe) {
+                parameter_sets.chunks = server_.video_parameter_set_chunks(profile_index_, frame.timestamp());
+                parameter_sets.video = true;
             }
-            if (accepted.empty()) return;
+            bool prepend_parameter_sets = false;
+
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (needs_video_sync_) {
+                if (!frame.video) return;
+                if (!frame.keyframe) return;
+                prepend_parameter_sets = true;
+                needs_video_sync_ = false;
+                trace("resync", "keyframe accepted");
+            }
+
+            size_t frame_bytes = frame.wire_size() +
+                                 (prepend_parameter_sets ? parameter_sets.wire_size() : 0);
             if (frame_bytes > max_queue_bytes_) {
-                dropped_ += accepted.size();
-                server_.queue_drops_.fetch_add(accepted.size(), std::memory_order_relaxed);
+                drop_frame_locked(frame, "frame_too_large");
                 return;
             }
             if (queue_bytes_ + frame_bytes > max_queue_bytes_) {
-                size_t dropped = queue_.size();
-                queue_.clear();
-                queue_bytes_ = 0;
-                dropped_ += dropped;
-                server_.queue_drops_.fetch_add(dropped, std::memory_order_relaxed);
-                trace("queue_clear", "client is not reading fast enough");
+                drop_queued_frames_locked("client is not reading fast enough");
+                if (!frame.video && needs_video_sync_) return;
+                if (frame.video && !frame.keyframe) {
+                    drop_frame_locked(frame, "waiting for keyframe");
+                    return;
+                }
+                if (frame.video && frame.keyframe && !prepend_parameter_sets) {
+                    prepend_parameter_sets = true;
+                    needs_video_sync_ = false;
+                    frame_bytes = frame.wire_size() + parameter_sets.wire_size();
+                    if (frame_bytes > max_queue_bytes_) {
+                        drop_frame_locked(frame, "frame_too_large");
+                        return;
+                    }
+                }
             }
-            for (const auto *chunk : accepted) {
-                queue_.push_back(*chunk);
-                queue_bytes_ += chunk->wire_size();
+            if (prepend_parameter_sets && !parameter_sets.chunks.empty()) {
+                queue_bytes_ += parameter_sets.wire_size();
+                queue_.push_back(std::move(parameter_sets));
             }
+            queue_bytes_ += frame.wire_size();
+            queue_.push_back(frame);
             queue_cv_.notify_one();
         }
 
     private:
-        static constexpr size_t max_queue_bytes_ = 2 * 1024 * 1024;
+        static constexpr size_t max_queue_bytes_ = 768 * 1024;
         static constexpr auto rtcp_interval_ = std::chrono::seconds(5);
         static constexpr auto session_timeout_ = std::chrono::seconds(60);
+        static constexpr auto send_deadline_ = std::chrono::seconds(2);
+        static constexpr int send_poll_ms_ = 100;
 
         enum class State {
             Init,
@@ -450,6 +497,37 @@ private:
             std::lock_guard<std::mutex> lock(queue_mutex_);
             queue_.clear();
             queue_bytes_ = 0;
+            needs_video_sync_ = false;
+        }
+
+        void drop_frame_locked(const RtpFrame &frame, const char *reason) {
+            dropped_ += frame.packet_count();
+            server_.queue_drops_.fetch_add(frame.packet_count(), std::memory_order_relaxed);
+            if (frame.video) mark_needs_video_sync_locked(reason);
+        }
+
+        void drop_queued_frames_locked(const char *reason) {
+            size_t dropped = 0;
+            bool dropped_video = false;
+            for (const auto &queued : queue_) {
+                dropped += queued.packet_count();
+                dropped_video = dropped_video || queued.video;
+            }
+            queue_.clear();
+            queue_bytes_ = 0;
+            dropped_ += dropped;
+            server_.queue_drops_.fetch_add(dropped, std::memory_order_relaxed);
+            trace("queue_clear", reason);
+            if (dropped_video) mark_needs_video_sync_locked(reason);
+        }
+
+        void mark_needs_video_sync_locked(const char *reason) {
+            if (!video_track_.setup) return;
+            if (!needs_video_sync_) {
+                needs_video_sync_ = true;
+                trace("needs_sync", reason);
+            }
+            server_.request_keyframe();
         }
 
         void trace(const char *event, const std::string &detail = {}) {
@@ -549,6 +627,7 @@ private:
                 if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
                 char buf[2048];
                 ssize_t n = recv(fd, buf, sizeof(buf), 0);
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
                 if (n <= 0) return false;
                 last_activity_ = std::chrono::steady_clock::now();
                 pending.append(buf, buf + n);
@@ -844,36 +923,37 @@ private:
         }
 
         void enqueue_video_parameter_sets(int profile_index, uint32_t timestamp) {
-            auto chunks = server_.video_parameter_set_chunks(profile_index, timestamp);
-            if (!chunks.empty()) enqueue(chunks);
+            RtpFrame frame;
+            frame.chunks = server_.video_parameter_set_chunks(profile_index, timestamp);
+            frame.video = true;
+            if (!frame.chunks.empty()) enqueue(frame);
         }
 
         bool send_raw(const std::string &resp) {
             std::lock_guard<std::mutex> lock(send_mutex_);
-            const uint8_t *data = reinterpret_cast<const uint8_t *>(resp.data());
-            size_t len = resp.size();
-            while (len) {
-                ssize_t n = send(fd_, data, len, MSG_NOSIGNAL);
-                if (n <= 0) return false;
-                data += n;
-                len -= static_cast<size_t>(n);
-            }
-            return true;
+            iovec iov{const_cast<char *>(resp.data()), resp.size()};
+            return send_iov_locked(&iov, 1);
         }
 
         void write_loop() {
             while (!closed()) {
-                RtpChunk chunk;
+                RtpFrame frame;
                 {
                     std::unique_lock<std::mutex> lock(queue_mutex_);
                     queue_cv_.wait(lock, [&] { return closed() || !queue_.empty(); });
                     if (closed()) break;
-                    chunk = queue_.front();
+                    frame = std::move(queue_.front());
                     queue_.pop_front();
-                    queue_bytes_ -= chunk.wire_size();
+                    queue_bytes_ -= frame.wire_size();
                 }
                 if (!playing()) continue;
-                if (!send_rtp(chunk)) break;
+                for (const auto &chunk : frame.chunks) {
+                    if (!send_rtp(chunk)) {
+                        trace("send_failed");
+                        closed_.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                }
             }
             closed_.store(true, std::memory_order_relaxed);
             close_socket();
@@ -921,24 +1001,7 @@ private:
             }
             {
                 std::lock_guard<std::mutex> lock(send_mutex_);
-                while (iovcnt > 0) {
-                    msghdr msg{};
-                    msg.msg_iov = cur;
-                    msg.msg_iovlen = static_cast<size_t>(iovcnt);
-                    ssize_t n = sendmsg(fd_, &msg, MSG_NOSIGNAL);
-                    if (n <= 0) return false;
-                    server_.send_bytes_.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
-                    ssize_t left = n;
-                    while (iovcnt > 0 && left >= static_cast<ssize_t>(cur[0].iov_len)) {
-                        left -= static_cast<ssize_t>(cur[0].iov_len);
-                        ++cur;
-                        --iovcnt;
-                    }
-                    if (iovcnt > 0 && left > 0) {
-                        cur[0].iov_base = static_cast<uint8_t *>(cur[0].iov_base) + left;
-                        cur[0].iov_len -= static_cast<size_t>(left);
-                    }
-                }
+                if (!send_iov_locked(cur, iovcnt)) return false;
             }
             server_.rtp_packets_.fetch_add(1, std::memory_order_relaxed);
             ++track.packet_count;
@@ -1046,12 +1109,27 @@ private:
         }
 
         bool send_iov_locked(iovec *iov, int iovcnt) {
+            auto deadline = std::chrono::steady_clock::now() + send_deadline_;
             iovec *cur = iov;
             while (iovcnt > 0) {
                 msghdr msg{};
                 msg.msg_iov = cur;
                 msg.msg_iovlen = static_cast<size_t>(iovcnt);
                 ssize_t n = sendmsg(fd_, &msg, MSG_NOSIGNAL);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    if (std::chrono::steady_clock::now() >= deadline) return false;
+                    int fd = fd_.load(std::memory_order_relaxed);
+                    if (fd < 0) return false;
+                    pollfd pfd{};
+                    pfd.fd = fd;
+                    pfd.events = POLLOUT;
+                    int pret = poll(&pfd, 1, send_poll_ms_);
+                    if (pret < 0 && errno == EINTR) continue;
+                    if (pret <= 0) continue;
+                    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+                    continue;
+                }
                 if (n <= 0) return false;
                 server_.send_bytes_.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
                 ssize_t left = n;
@@ -1091,9 +1169,10 @@ private:
         std::mutex send_mutex_;
         std::mutex queue_mutex_;
         std::condition_variable queue_cv_;
-        std::deque<RtpChunk> queue_;
+        std::deque<RtpFrame> queue_;
         size_t queue_bytes_ = 0;
         uint64_t dropped_ = 0;
+        bool needs_video_sync_ = false;
         std::thread read_thread_;
         std::thread write_thread_;
     };
@@ -1330,7 +1409,19 @@ private:
         audio_marker_.store(true, std::memory_order_relaxed);
     }
 
-    void broadcast(const std::vector<RtpChunk> &chunks) {
+    bool is_video_keyframe(const ProfileState &profile, const std::vector<NalUnit> &nals) const {
+        for (const auto &nal : nals) {
+            uint8_t type = video_nal_type(profile, nal);
+            if (profile.profile.video_codec == VideoCodec::H264) {
+                if (type == 5) return true;
+            } else if (type >= 16 && type <= 21) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void broadcast(const RtpFrame &frame) {
         std::vector<std::shared_ptr<Session>> sessions;
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -1338,7 +1429,7 @@ private:
             sessions = sessions_;
         }
         for (const auto &session : sessions) {
-            session->enqueue(chunks);
+            session->enqueue(frame);
         }
     }
 

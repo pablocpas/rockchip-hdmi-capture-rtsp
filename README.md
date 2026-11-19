@@ -1,323 +1,244 @@
 # Rockchip HDMI Capture RTSP Streamer
 
-Low-latency HDMI UVC capture streamer for Rockchip boards.
+Low-latency HDMI UVC capture and direct RTSP/TCP server for Rockchip SBCs.
 
-It captures video from MacroSilicon-style HDMI USB capture dongles, converts it
-with Rockchip MPP/RGA when available, encodes H.264 with Rockchip MPP, captures
-ALSA audio, and serves a direct RTSP/TCP stream. It is intended for small ARM
-boards where a full FFmpeg plus relay-server pipeline wastes too much CPU.
+Captures HDMI video (V4L2) and audio (ALSA) from MacroSilicon-style USB capture
+dongles, processes video on Rockchip hardware (MPP / RGA), and serves one or
+more RTSP/TCP streams directly without FFmpeg or an external relay.
 
-## What It Supports
+## Features
 
-- Direct RTSP/TCP interleaved server, no relay required.
-- H.264 video from Rockchip MPP encoder by default.
-- Experimental H.265/HEVC video via `--video-codec h265` for lower bitrate tests.
-- MJPEG capture path: UVC MJPEG -> MPP JPEG -> MPP H.264.
-- RGA capture path: UVC YUYV -> RGA NV12 -> MPP H.264.
-- CPU fallback path: UVC YUYV -> libyuv NV12 -> MPP H.264.
-- ALSA audio with Opus or L16 RTP payloads.
-- On-demand capture: the device starts when an RTSP client enters `PLAY`.
-- Small multi-client use, typically a few viewers.
+- Single-thread `epoll` RTSP/TCP interleaved server with pooled RTP buffers, `TCP_NOTSENT_LOWAT` backpressure control, and per-stream send timeouts.
+- Shared hardware capture feeding multiple simultaneous **on-demand** output streams (`/hq`, `/h265`, `/coche`, `/audio`): each encoder and RGA scaler is created only while clients are connected.
+- Audio-only endpoints (`video=false`): never open V4L2, MPP, or RGA when no video stream is active.
+- Rockchip MPP hardware encoding (H.264 and H.265/HEVC) with `vbr` and `cbr` rate control.
+- Hardware RGA NV12 downscaling (`1080p -> 720p`) and FPS decimation (`50 -> 25 fps`), available under both `mjpeg` and `rga` capture modes.
+- Shared ALSA audio capture (Opus or L16), encoded once and broadcast to all active streams.
+- Composable Unix CLI (`--opt=val`, short flags, `k`/`M` bitrates, `-s WxH`, stdin config, `--check-config`, `--print-config`, `SIGUSR1`/`SIGUSR2`, manpage).
 
-## Recommended Profiles
+## Capture Modes
 
-Use the interactive configurator unless you already know the exact mode your
-dongle exposes:
+Select the capture pipeline in `[capture]` or with `--stream-profile`:
 
-```bash
-sudo scripts/configure.sh
-scripts/doctor.sh
-```
-
-The profiles are:
-
-| Profile | Pipeline | Use when |
+| Mode | Pipeline | When to use |
 | --- | --- | --- |
-| `rga` | YUYV DMA-BUF -> RGA NV12 -> MPP H.264 | Best-performance path when YUYV mode and `librga.so` are available |
-| `mjpeg` | MJPEG DMA-BUF -> MPP JPEG -> MPP H.264 | Safest fallback and default for most dongles |
-| `yuyv-libyuv` | YUYV -> CPU libyuv NV12 -> MPP H.264 | Debug/fallback when RGA is unavailable |
+| `mjpeg` | MJPEG DMA-BUF -> MPP JPEG -> NV12 | **Default.** Low USB/kernel load (~15 MB/s), works on USB2 and USB3, still uses RGA for 720p downscaling |
+| `rga` | YUYV DMA-BUF -> RGA NV12 | No prior JPEG compression and ~2–3 ms lower latency on dedicated USB3 (207 MB/s @ 1080p50) |
+| `yuyv-libyuv` | YUYV -> CPU libyuv/NEON NV12 | Fallback/debug when RGA is unavailable |
 
-`scripts/configure.sh` offers goal-oriented choices:
+If a capture device rejects DMA-BUF in `mjpeg` mode, capture automatically falls
+back to `mmap` while still decoding on MPP.
 
-| Choice | Behavior |
-| --- | --- |
-| Auto | Keeps the current resolution/FPS when valid; prefers RGA if possible, otherwise MJPEG |
-| Best performance | Chooses the best common YUYV mode for RGA |
-| Most compatible | Chooses the best common MJPEG mode |
-| TV cadence | Prefers 1080p50, then 720p50, then 1080p30 |
-| Custom | Manual resolution, FPS, bitrate, profile, and paths |
+### Tested Hardware
 
-## Tested Hardware
-
-Tested most heavily on:
-
-- NanoPi R3S LTS / RK3568.
-- MacroSilicon MS2131-style USB3 HDMI capture dongle.
-- MacroSilicon MS2109-style HDMI capture dongle.
-
-Observed behavior:
-
-| Device class | Typical modes | Recommendation |
-| --- | --- | --- |
-| MS2131 / USB3 | 1080p50/60 in `MJPG` and often `YUYV` | Prefer `rga` when RGA is installed; use `mjpeg` as safe fallback |
-| MS2109 / USB2 | often no `YUYV 1920x1080@50`; 1080p may be lower FPS | Use `mjpeg` at the best advertised mode |
-
-For European TV/set-top-box use, 50 fps usually preserves motion cadence better
-than 30 fps. For cameras, consoles, desktop capture, or other HDMI sources,
-choose an FPS that matches the source and appears in `v4l2-ctl --list-formats-ext`.
+- NanoPi R3S LTS (RK3568)
+- MacroSilicon MS2131 (USB3): supports 1080p50/60 in `MJPG` and `YUYV` (`mjpeg` recommended for lowest USB/kernel load; `rga` for sharpest desktop/text capture)
+- MacroSilicon MS2109 (USB2): use `mjpeg` at the highest mode listed by `v4l2-ctl --list-formats-ext`
 
 ## Quick Start From Release
 
-Install runtime tools and libraries:
+Install runtime dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y v4l-utils alsa-utils libv4l-0 libturbojpeg0 libasound2 libopus0
+sudo apt install -y v4l-utils alsa-utils libasound2 libopus0
 ```
 
-You also need Rockchip MPP runtime libraries from the board image or vendor
-packages. Many Rockchip images include them already.
+Rockchip MPP runtime libraries must also be present (included in most Rockchip
+board images).
 
-Install the release tarball:
+Install from a release tarball:
 
 ```bash
 tar -xzf rockchip-hdmi-capture-rtsp-*-linux-aarch64.tar.gz
 cd rockchip-hdmi-capture-rtsp-*-linux-aarch64
 sudo install -m 755 bin/rk-hdmi-streamer /usr/local/bin/rk-hdmi-streamer
+sudo install -m 644 man/rk-hdmi-streamer.1 /usr/local/share/man/man1/rk-hdmi-streamer.1
 sudo install -m 644 systemd/rk-hdmi-streamer.conf /etc/rk-hdmi-streamer.conf
 sudo install -m 644 systemd/rk-hdmi-streamer-direct.service /etc/systemd/system/rk-hdmi-streamer.service
 ```
 
-Configure and start:
+Validate configuration and start the service:
 
 ```bash
-sudo scripts/configure.sh
+sudoedit /etc/rk-hdmi-streamer.conf
+rk-hdmi-streamer -c /etc/rk-hdmi-streamer.conf --check-config
 sudo systemctl daemon-reload
 sudo systemctl enable --now rk-hdmi-streamer.service
-scripts/doctor.sh
 ```
 
-Open:
+Default endpoints:
 
 ```text
-rtsp://BOARD_IP:8554/capture
+rtsp://BOARD_IP:8554/hq     # 1080p50 H.264 VBR 15M + Opus (LAN / Wi-Fi)
+rtsp://BOARD_IP:8554/h265   # 1080p50 H.265 VBR 6M  + Opus (remote / 5G)
+rtsp://BOARD_IP:8554/coche  # 720p25  H.265 VBR 2M  + Opus (mobile / car, 10 s timeout)
+rtsp://BOARD_IP:8554/audio  # Opus audio-only (no video capture opened, 12 s timeout)
 ```
 
-Run `sudo scripts/configure.sh` again whenever you change dongle, resolution,
-FPS, bitrate, audio device, RTSP path, or profile. If the service is installed,
-the configurator offers to restart it after writing the config.
+For guided configuration, run `sudo scripts/configure.sh`.
+
+## Configuration
+
+The systemd unit reads `/etc/rk-hdmi-streamer.conf`:
+
+```ini
+[capture]
+device=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
+audio-device=hw:CARD=Video,DEV=0
+audio=true
+audio-codec=opus
+audio-gain=3.0
+audio-frame-ms=20
+stream-profile=mjpeg
+width=1920
+height=1080
+fps=50
+video-codec=h264
+rc-mode=vbr
+bitrate=15000000
+gop=50
+rtp-payload=1400
+listen-rtsp=:8554
+rtsp-path=/hq
+rtsp-send-timeout-ms=3000
+max-clients=5
+rtsp-debug=false
+
+[stream.h265]
+path=/h265
+codec=h265
+bitrate=6000000
+rc-mode=vbr
+gop=50
+rtsp-send-timeout-ms=6000
+
+[stream.coche]
+path=/coche
+codec=h265
+width=1280
+height=720
+fps=25
+bitrate=2000000
+rc-mode=vbr
+gop=25
+rtsp-send-timeout-ms=10000
+
+[stream.audio]
+path=/audio
+video=false
+audio=true
+rtsp-send-timeout-ms=12000
+```
+
+- Prefer `/dev/v4l/by-id/...video-index0` over `/dev/videoN` so device numbering stays stable across reboots.
+- `[capture]` (legacy alias `[main]`) defines the shared HDMI/ALSA input and default stream.
+- Each `[stream.<name>]` (legacy alias `[profile.<name>]`) inherits `[capture]`, overrides output parameters (`path`, `video`, `audio`, `codec`, `rc-mode`, `bitrate`, `size`/`width`/`height`, `fps`, `gop`, `rtsp-send-timeout-ms`), and runs on demand.
+- On RK3568 (VEPU540), simultaneous streams such as `/hq` (`1080p50`) + `/coche` (`720p25`) + `/audio` fit comfortably within the hardware encoder budget.
+
+## CLI & Signals
+
+See `rk-hdmi-streamer --help` or `man rk-hdmi-streamer` ([man/rk-hdmi-streamer.1](man/rk-hdmi-streamer.1)) for the full option list.
+
+- All long options accept `--opt value` and `--opt=value`; bitrates accept `k`/`M`/`G` suffixes (`15M`, `2.5M`); resolutions accept `-s 1920x1080`.
+- `--check-config` validates and exits (`0` valid, `2` config/CLI error, `1` runtime error).
+- `--print-config` prints effective normalized INI to `stdout`; `-c -` reads INI from `stdin`.
+- `-o PATH` writes raw Annex-B video (`-` for `stdout`) or publishes to `rtsp://...`.
+- Signals: `SIGINT`/`SIGTERM` stop cleanly, `SIGUSR1` prints live stats to `stderr`, `SIGUSR2` forces an immediate IDR keyframe on all active video encoders.
+
+Example ad-hoc run:
+
+```bash
+rk-hdmi-streamer --stream-profile=mjpeg -s 1920x1080 -r 50 -b 15M --rc-mode=vbr \
+  --audio-codec=opus -l :8554 --rtsp-path=/hq --max-clients=5 \
+  --rtsp-stream=path=/coche,size=1280x720,fps=25,codec=h265,bitrate=2M,rc-mode=vbr,gop=25,send-timeout-ms=10000 \
+  --rtsp-stream=path=/audio,video=false,audio=true,send-timeout-ms=12000
+```
 
 ## RGA Runtime
 
-RGA is optional but recommended for the lowest CPU path when the capture dongle
-advertises a matching YUYV mode.
+RGA (`librga.so`) is optional and loaded dynamically via `dlopen`. It accelerates
+both `YUYV -> NV12` conversion (`stream-profile=rga`) and hardware `NV12`
+downscaling (e.g. `1080p -> 720p` in `/coche`, even under `stream-profile=mjpeg`).
 
-If the release tarball includes `third_party/librga/aarch64/librga.so`, either
-install it system-wide:
+Install `librga.so` system-wide:
 
 ```bash
 sudo install -m 755 third_party/librga/aarch64/librga.so /usr/local/lib/librga.so
 sudo ldconfig
 ```
 
-or point the config at it:
-
-```ini
-[main]
-rga-library=/path/to/librga.so
-```
-
-The main binary loads `librga.so` only when `stream-profile=rga` is selected, so
-systems without RGA can still use `mjpeg` and `yuyv-libyuv`.
-
-## Configuration Files
-
-The systemd service reads:
-
-```text
-/etc/rk-hdmi-streamer.conf
-```
-
-Example:
-
-```ini
-[main]
-device=/dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0
-audio-device=hw:CARD=Video,DEV=0
-video-codec=h264
-audio-codec=opus
-stream-profile=mjpeg
-width=1920
-height=1080
-fps=50
-bitrate=18000000
-gop=50
-listen-rtsp=:8554
-rtsp-path=/capture
-
-[profile.720p50]
-path=/720p50
-stream-profile=rga
-width=1280
-height=720
-fps=50
-codec=h265
-bitrate=4000000
-gop=50
-```
-
-Prefer `/dev/v4l/by-id/...video-index0` over `/dev/videoN`; the numeric node can
-change after reboot or replug.
-
-Extra RTSP profiles use `[profile.NAME]` sections. Each profile inherits
-`[main]` and overrides only the keys listed in its section. The default
-`rtsp-path` remains available, so the example exposes both `/capture` and
-`/720p50`.
-
-## Diagnostics
-
-Run:
-
-```bash
-scripts/doctor.sh
-```
-
-It checks:
-
-- installed config
-- V4L2 capture nodes, excluding metadata nodes
-- whether the requested format/resolution/FPS exists
-- ALSA capture device
-- RGA runtime availability
-- RTSP port state
-- `rk-hdmi-streamer.service`
-- `mediamtx.service` conflicts
-
-Manual checks:
-
-```bash
-v4l2-ctl --list-devices
-v4l2-ctl -d /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0 --list-formats-ext
-arecord -l
-journalctl -u rk-hdmi-streamer.service -n 100 --no-pager
-```
+or specify `rga-library=/path/to/librga.so` under `[capture]`. If `librga.so` is
+absent on a downscaled stream, scaling falls back automatically to CPU.
 
 ## Build From Source
 
-Install build dependencies:
+Install build dependencies (plus Rockchip MPP development headers, e.g. `librockchip-mpp-dev`):
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake pkg-config git \
-  libv4l-dev libturbojpeg0-dev libasound2-dev libopus-dev
+  libasound2-dev libopus-dev libyuv-dev
 ```
 
-You also need Rockchip MPP development headers and pkg-config metadata, usually
-from your board image or a package such as `librockchip-mpp-dev`.
-
-Build:
+Build and install (recommended RK3568 configuration with RGA and Cortex-A55/LSE tuning):
 
 ```bash
+git clone --depth=1 https://github.com/airockchip/librga.git ~/librga
 git clone https://github.com/pablocpas/rockchip-hdmi-capture-rtsp.git
 cd rockchip-hdmi-capture-rtsp
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRK_CPU=cortex-a55 -DRGA_ROOT="$HOME/librga"
 cmake --build build -j"$(nproc)"
 sudo cmake --install build
 ```
 
-Build with RGA headers from Rockchip's `librga` checkout:
+Without RGA headers, omit `-DRGA_ROOT=...`.
+
+### Release Tarball
 
 ```bash
-git clone --depth=1 https://github.com/airockchip/librga.git ~/librga
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRGA_ROOT="$HOME/librga"
-cmake --build build -j"$(nproc)"
+RK_CPU=cortex-a55 RGA_ROOT="$HOME/librga" scripts/package-release.sh v0.3.0
 ```
 
-## Build A Release Tarball
+Outputs `dist/rockchip-hdmi-capture-rtsp-v0.3.0-linux-aarch64.tar.gz` and its `.sha256`.
 
-Without bundled RGA:
+## Testing & Diagnostics
+
+Host unit tests (no Rockchip hardware required):
 
 ```bash
-scripts/package-release.sh v0.2.0
+cmake -S . -B build-host -DRK_BUILD_STREAMER=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-host --parallel
+ctest --test-dir build-host --output-on-failure
 ```
 
-With bundled RGA runtime:
+Sustained loopback stress test (add `-DRK_STRESS_SECONDS=60` and run `ctest --test-dir build-host -L stress -V`).
+CI runs the suite under ASan/UBSan; TSan can be run with `-DCMAKE_CXX_FLAGS='-fsanitize=thread -fno-omit-frame-pointer'`.
+
+Live deployment test and board profiling:
 
 ```bash
-RGA_ROOT="$HOME/librga" scripts/package-release.sh v0.2.0
+tests/stress-live.sh rtsp://BOARD_IP:8554/hq 30 3 4
+pidstat -ur -p "$(systemctl show -p MainPID --value rk-hdmi-streamer.service)" 1
+mpstat 1 10
+grep -E 'MemAvailable|CmaTotal|CmaFree' /proc/meminfo
 ```
 
-The generated files are written to `dist/`:
-
-```text
-rockchip-hdmi-capture-rtsp-v0.2.0-linux-aarch64.tar.gz
-rockchip-hdmi-capture-rtsp-v0.2.0-linux-aarch64.tar.gz.sha256
-```
-
-## Manual Run Examples
-
-Direct RTSP, compatible MJPEG path:
+Inspect a running setup:
 
 ```bash
-rk-hdmi-streamer \
-  --stream-profile mjpeg \
-  --device /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0 \
-  --audio-device hw:CARD=Video,DEV=0 \
-  --audio-codec opus \
-  --audio-gain 3.0 \
-  --audio-frame-ms 20 \
-  --width 1920 \
-  --height 1080 \
-  --fps 50 \
-  --bitrate 18000000 \
-  --gop 50 \
-  --rtp-payload 1400 \
-  --listen-rtsp :8554 \
-  --rtsp-path /capture \
-  --max-clients 3
+rk-hdmi-streamer -c /etc/rk-hdmi-streamer.conf --print-config
+v4l2-ctl --list-devices
+arecord -l
+ss -ltn 'sport = :8554'
+journalctl -u rk-hdmi-streamer.service -n 100 --no-pager
 ```
 
-Direct RTSP, best-performance RGA path:
+## Network & Troubleshooting
 
-```bash
-rk-hdmi-streamer \
-  --stream-profile rga \
-  --rga-library "$HOME/librga/libs/Linux/gcc-aarch64/librga.so" \
-  --device /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0 \
-  --audio-device hw:CARD=Video,DEV=0 \
-  --audio-codec opus \
-  --audio-gain 3.0 \
-  --audio-frame-ms 20 \
-  --width 1920 \
-  --height 1080 \
-  --fps 50 \
-  --bitrate 18000000 \
-  --gop 50 \
-  --listen-rtsp :8554 \
-  --rtsp-path /capture
-```
-
-Raw H.264 file for debugging:
-
-```bash
-rk-hdmi-streamer \
-  --stream-profile mjpeg \
-  --device /dev/v4l/by-id/usb-MACROSILICON_USB3_Video_20210623-video-index0 \
-  --no-audio \
-  --width 1920 \
-  --height 1080 \
-  --fps 50 \
-  --bitrate 18000000 \
-  --frames 300 \
-  --output /tmp/capture.h264
-```
-
-## Network Notes
-
-The direct server uses RTSP/TCP interleaved RTP. This is usually stable over
-tunnels such as WireGuard because it avoids UDP-over-UDP loss amplification.
-
-For Linux TCP tuning, BBR plus `fq` is a reasonable starting point:
+- The RTSP server has no authentication; bind to a trusted interface or expose it over a VPN such as WireGuard.
+- WireGuard + RTSP/TCP interleaved works well over mobile connections (transparent IP roaming across cell handovers, no UDP-over-UDP loss amplification).
+- Recommended Linux TCP sysctls:
 
 ```bash
 sudo tee /etc/sysctl.d/99-rk-streaming.conf >/dev/null <<'EOF'
@@ -328,37 +249,8 @@ EOF
 sudo sysctl --system
 ```
 
-## Troubleshooting
-
-If video is black or has artifacts:
-
-- Run `scripts/doctor.sh`.
-- Confirm the dongle supports the requested mode with `v4l2-ctl`.
-- Try `stream-profile=mjpeg` first.
-- If using RGA, confirm `rga-library` points to a valid `librga.so`.
-- Lower bitrate temporarily and check system logs.
-
-If audio is missing:
-
-- Check `arecord -l` and adjust `audio-device`.
-- Try `audio-codec=l16` to isolate Opus/client issues.
-- Increase `audio-gain` if the source is quiet.
-- Use `audio-frame-ms=20` for normal Opus RTP frame size.
-- On VLC for Android, if audio works the first time but not after reopening the
-  same RTSP stream, change VLC's advanced audio output from `AudioTrack` to
-  `OpenSL ES`.
-
-If the service does not start:
-
-```bash
-journalctl -u rk-hdmi-streamer.service -n 100 --no-pager
-```
-
-## Notes
-
-- Direct RTSP is preferred for this small-client use case.
-- CPU usage depends on bitrate, client count, kernel, MPP version, capture
-  dongle, memory clocks, and whether the stream goes through a tunnel.
+- **Black video or artifacts:** verify the mode with `v4l2-ctl -d <dev> --list-formats-ext`, test `stream-profile=mjpeg`, and check `journalctl -u rk-hdmi-streamer.service`.
+- **Missing audio:** verify `arecord -l` and `audio-device`; on VLC for Android, switch audio output from `AudioTrack` to `OpenSL ES` if audio stops on reconnect.
 
 ## License
 

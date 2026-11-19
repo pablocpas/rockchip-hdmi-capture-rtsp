@@ -2,8 +2,6 @@
 
 #include <string.h>
 
-#include "rk_mpi.h"
-
 bool strip_annexb_start_code(const uint8_t **data, size_t *size) {
     if (*size >= 4 && (*data)[0] == 0 && (*data)[1] == 0 && (*data)[2] == 0 && (*data)[3] == 1) {
         *data += 4;
@@ -19,71 +17,63 @@ bool strip_annexb_start_code(const uint8_t **data, size_t *size) {
 }
 
 size_t find_start_code(const uint8_t *data, size_t size, size_t pos, size_t *prefix) {
-    size_t i = pos;
-    while (i + 3 <= size) {
-        const void *next_zero = memchr(data + i, 0, size - i - 2);
-        if (!next_zero) return size;
-        i = static_cast<const uint8_t *>(next_zero) - data;
-
-        if (i + 4 <= size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
-            *prefix = 4;
-            return i;
-        }
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+    if (pos + 3 > size) return size;
+    const uint8_t *p = data + pos + 2;
+    const uint8_t *end = data + size;
+    while (p < end) {
+        const auto *one = static_cast<const uint8_t *>(memchr(p, 1, static_cast<size_t>(end - p)));
+        if (!one) return size;
+        if (one[-1] == 0 && one[-2] == 0) {
+            const size_t idx = static_cast<size_t>(one - data);
+            if (idx >= pos + 3 && one[-3] == 0) {
+                *prefix = 4;
+                return idx - 3;
+            }
             *prefix = 3;
-            return i;
+            return idx - 2;
         }
-        ++i;
+        p = one + 1;
     }
     return size;
 }
 
-std::vector<NalUnit> parse_annexb(const uint8_t *data, size_t size) {
-    std::vector<NalUnit> out;
+void parse_annexb(const uint8_t *data, size_t size, std::vector<NalUnit> &out) {
+    out.clear();
+    if (!data || size < 3) return;
     size_t prefix = 0;
     size_t start = find_start_code(data, size, 0, &prefix);
     while (start < size) {
-        size_t nal_start = start + prefix;
+        const size_t nal_start = start + prefix;
         size_t next_prefix = 0;
-        size_t next = find_start_code(data, size, nal_start, &next_prefix);
+        const size_t next = find_start_code(data, size, nal_start, &next_prefix);
         size_t nal_end = next;
         while (nal_end > nal_start && data[nal_end - 1] == 0) --nal_end;
         if (nal_end > nal_start) out.push_back({data + nal_start, nal_end - nal_start});
         start = next;
         prefix = next_prefix;
     }
+}
+
+std::vector<NalUnit> parse_annexb(const uint8_t *data, size_t size) {
+    std::vector<NalUnit> out;
+    out.reserve(8);
+    parse_annexb(data, size, out);
     return out;
 }
 
-std::vector<NalUnit> nals_from_mpp_segments(const EncodedPacket &packet) {
-    std::vector<NalUnit> out;
-    if (!packet.mpp_packet || !packet.data || packet.len == 0) return out;
-
-    MppPacket mpp_packet = packet.mpp_packet.get();
-    RK_U32 segment_nb = mpp_packet_get_segment_nb(mpp_packet);
-    const MppPktSeg *seg = mpp_packet_get_segment_info(mpp_packet);
-    if (!segment_nb || !seg) return out;
-
-    out.reserve(segment_nb);
-    for (RK_U32 i = 0; i < segment_nb && seg; ++i, seg = seg->next) {
-        if (seg->offset > packet.len || seg->len > packet.len - seg->offset) {
-            out.clear();
-            return out;
-        }
-
-        const uint8_t *nal = packet.data + seg->offset;
-        size_t nal_size = seg->len;
-        strip_annexb_start_code(&nal, &nal_size);
-        while (nal_size > 0 && nal[nal_size - 1] == 0) --nal_size;
-        if (nal_size > 0) out.push_back({nal, nal_size});
+void packet_nals(const EncodedPacket &packet, std::vector<NalUnit> &out) {
+    if (packet.nal_provider) {
+        out.clear();
+        if (packet.nal_provider(packet, out) && !out.empty()) return;
     }
-    return out;
+    parse_annexb(packet.data, packet.len, out);
 }
 
 std::vector<NalUnit> packet_nals(const EncodedPacket &packet) {
-    auto nals = nals_from_mpp_segments(packet);
-    if (!nals.empty()) return nals;
-    return parse_annexb(packet.data, packet.len);
+    std::vector<NalUnit> out;
+    out.reserve(8);
+    packet_nals(packet, out);
+    return out;
 }
 
 std::string base64_encode(const uint8_t *data, size_t len) {

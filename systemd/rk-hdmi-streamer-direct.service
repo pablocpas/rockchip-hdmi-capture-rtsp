@@ -2,16 +2,15 @@
 Description=Rockchip HDMI capture RTSP server
 Wants=network-online.target
 After=network-online.target
-Conflicts=mediamtx.service
 
 [Service]
 Type=simple
 Environment=CONFIG_FILE=/etc/rk-hdmi-streamer.conf
-ExecStartPre=+/bin/sh -c 'gov="$(sed -n "s/^[[:space:]]*cpu-governor[[:space:]]*=[[:space:]]*//p" "$CONFIG_FILE" 2>/dev/null | tail -n1)"; [ -n "$gov" ] || gov=performance; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && printf "%%s\n" "$gov" > "$g" || true; done'
 ExecStart=/usr/local/bin/rk-hdmi-streamer --config ${CONFIG_FILE}
-Restart=always
+Restart=on-failure
 RestartSec=2
-Nice=-5
+NoNewPrivileges=yes
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

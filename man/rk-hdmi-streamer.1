@@ -1,0 +1,191 @@
+.TH RK-HDMI-STREAMER 1 "2026" "rk-hdmi-streamer 0.3.0" "User Commands"
+.SH NAME
+rk-hdmi-streamer \- low-latency Rockchip MPP/RGA HDMI capture & multi-stream RTSP server
+.SH SYNOPSIS
+.B rk-hdmi-streamer
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B rk-hdmi-streamer
+captures HDMI video from V4L2 UVC capture devices and audio from ALSA, encodes H.264/H.265 using Rockchip MPP hardware (with optional RGA DMA-BUF conversion and scaling), and outputs either:
+.IP \(bu 2
+a direct single-thread \fBepoll\fR RTSP/TCP server supporting multiple simultaneous on-demand output streams (including downscaled, lower-FPS, and audio-only endpoints) sharing one capture source;
+.IP \(bu 2
+an RTSP publisher (\fB\-o rtsp://...\fR); or
+.IP \(bu 2
+a raw Annex-B H.264/H.265 elementary stream to a file or \fBstdout\fR (\fB\-o \-\fR) for Unix piping.
+.PP
+All long flags accept both \fB\-\-option value\fR and \fB\-\-option=value\fR.
+Diagnostic output goes to \fBstderr\fR so \fBstdout\fR remains clean for \fB\-o \-\fR and \fB\-\-print\-config\fR.
+.SH OPTIONS
+.SS General & Unix Composability
+.TP
+.BR \-c ", " \-\-config " " \fIPATH\fR
+Read INI configuration before CLI flags. Use \fB\-\fR to read from \fBstdin\fR.
+.TP
+.B \-\-check\-config
+Validate the effective configuration and exit (\fB0\fR if valid, \fB2\fR on error).
+.TP
+.B \-\-print\-config
+Write the effective normalized INI configuration to \fBstdout\fR and exit.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress periodic statistics and startup diagnostics on \fBstderr\fR (errors still print).
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose RTSP session tracing (alias for \fB\-\-rtsp\-debug\fR).
+.TP
+.BI \-\-stats\-interval " N"
+Statistics interval in seconds (\fB0\fR disables periodic stats; default \fB5\fR).
+.TP
+.BR \-V ", " \-\-version
+Print version and compiled feature flags (\fBrga\fR, \fBopus\fR, \fBlibyuv\fR, \fBneon\fR) and exit.
+.TP
+.BR \-h ", " \-\-help
+Show option summary and exit.
+.SS Capture Input
+.TP
+.BR \-d ", " \-\-device " " \fIPATH\fR
+V4L2 video capture node (prefer \fI/dev/v4l/by-id/...\fR).
+.TP
+.BI \-\-stream\-profile " NAME"
+Capture pipeline preset: \fBmjpeg\fR (MJPEG DMA-BUF \-> MPP JPEG), \fBrga\fR (YUYV DMA-BUF \-> RGA NV12), or \fByuyv-libyuv\fR.
+.TP
+.BI \-\-input\-format " FMT"
+Raw V4L2 pixel format: \fBmjpeg\fR or \fByuyv\fR/\fByuy2\fR (default \fBmjpeg\fR).
+.TP
+.BI \-\-yuyv\-converter " CONV"
+YUYV\-to\-NV12 converter: \fBrga\fR or \fBlibyuv\fR.
+.TP
+.BI \-\-rga\-library " PATH"
+Explicit path to \fIlibrga.so\fR (also respects \fBRGA_LIBRARY\fR env var).
+.TP
+.BR \-\-v4l2\-dmabuf ", " \-\-no\-v4l2\-dmabuf
+Enable or disable zero-copy V4L2 DMA-BUF capture into MPP/DRM buffers.
+.TP
+.BR \-s ", " \-\-size " " \fIW\fBx\fIH\fR
+Set width and height together (e.g. \fB1920x1080\fR, \fB1280x720\fR). Also available individually via \fB\-\-width\fR and \fB\-\-height\fR.
+.TP
+.BR \-r ", " \-\-fps " " \fIN\fR
+Capture or stream frame rate (default \fB50\fR).
+.TP
+.BI \-\-video\-range " RANGE"
+Color range metadata: \fBlimited\fR, \fBfull\fR, or \fBunspecified\fR.
+.SS Video Encoder (Rockchip MPP)
+.TP
+.BR \-\-video ", " \-\-no\-video
+Enable or disable video track. Setting \fBvideo=false\fR on an RTSP stream creates an audio-only endpoint that never opens V4L2, MPP, or RGA.
+.TP
+.BI \-\-video\-codec " CODEC"
+\fBh264\fR or \fBh265\fR/\fBhevc\fR (default \fBh264\fR).
+.TP
+.BI \-\-rc\-mode " MODE"
+Rate control mode: \fBcbr\fR or \fBvbr\fR (recommended for lower network/CPU load).
+.TP
+.BR \-b ", " \-\-bitrate " " \fIRATE\fR
+Target bitrate in bit/s. Accepts human suffixes \fBk\fR/\fBK\fR, \fBm\fR/\fBM\fR, \fBg\fR/\fBG\fR (e.g. \fB15M\fR, \fB2.5M\fR, \fB2500k\fR).
+.TP
+.BI \-\-gop " N"
+Key-frame interval in frames (default \fB50\fR).
+.SS Audio Capture (ALSA)
+.TP
+.BR \-\-audio ", " \-\-no\-audio
+Enable or disable audio capture and RTP audio track.
+.TP
+.BI \-\-audio\-device " ID"
+ALSA capture device (default \fBhw:CARD=Video,DEV=0\fR).
+.TP
+.BI \-\-audio\-codec " CODEC"
+\fBopus\fR (48 kHz stereo) or \fBl16\fR (uncompressed 16-bit PCM).
+.TP
+.BI \-\-audio\-gain " N"
+Fixed-point Q16 PCM gain multiplier before encoding (default \fB1.0\fR).
+.TP
+.BI \-\-audio\-frame\-ms " MS"
+Audio packet duration: \fB2.5\fR, \fB5\fR, \fB10\fR, \fB20\fR, \fB40\fR, or \fB60\fR ms (default \fB20\fR).
+.SS Output & Multi-Stream RTSP Server
+.TP
+.BR \-o ", " \-\-output " " \fIPATH\fR
+Write raw Annex-B video to \fIPATH\fR (\fB\-\fR for \fBstdout\fR) or publish to an \fBrtsp://\fR URL.
+.TP
+.BR \-l ", " \-\-listen\-rtsp " " \fIADDR\fR
+Start direct RTSP/TCP server listening on \fIADDR\fR (e.g. \fB:8554\fR, \fB0.0.0.0:8554\fR, \fB[::1]:8554\fR).
+.TP
+.BI \-\-rtsp\-path " PATH"
+Default stream path (default \fB/capture\fR).
+.TP
+.BI \-\-rtsp\-stream " SPEC"
+Add an on-demand simultaneous output stream using comma-separated \fBkey=value\fR pairs (alias: \fB\-\-rtsp\-profile\fR). Supported keys include \fBname\fR, \fBpath\fR, \fBvideo\fR, \fBaudio\fR, \fBcodec\fR, \fBsize\fR/\fBwidth\fR/\fBheight\fR, \fBfps\fR, \fBbitrate\fR, \fBrc-mode\fR, \fBgop\fR, and \fBsend-timeout-ms\fR.
+.TP
+.BI \-\-rtsp\-send\-timeout\-ms " MS"
+Maximum stalled TCP write duration before closing a slow client (default \fB2000\fR; use \fB8000\fR\-\fB12000\fR for mobile/car links).
+.TP
+.BI \-\-rtsp\-idle\-grace\-ms " MS"
+Keep MPP/RGA resources warm after the last client disconnects while pausing V4L2 capture (default \fB3000\fR).
+.TP
+.BI \-\-rtp\-payload " BYTES"
+Maximum RTP payload size per packet (default \fB1400\fR).
+.TP
+.BI \-\-max\-clients " N"
+Maximum concurrent RTSP clients (default \fB3\fR, max \fB16\fR).
+.TP
+.BI \-\-frames " N"
+Stop cleanly after \fIN\fR encoded frames (\fB0\fR runs forever).
+.SH CONFIGURATION FILE
+INI files use \fB[capture]\fR (alias \fB[main]\fR) for the shared hardware input and default stream, followed by any number of \fB[stream.\fINAME\fB]\fR (alias \fB[profile.\fINAME\fB]\fR) sections. CLI flags override INI values.
+.SH SIGNALS
+.TP
+.BR SIGINT ", " SIGTERM
+Graceful shutdown and clean release of V4L2, MPP, RGA, ALSA, and sockets.
+.TP
+.B SIGUSR1
+Immediately print current capture and RTSP statistics to \fBstderr\fR.
+.TP
+.B SIGUSR2
+Force an immediate IDR keyframe on all active video encoders.
+.TP
+.B SIGPIPE
+Ignored so broken downstream pipes (\fB\-o \-\fR) exit cleanly.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal exit, \fB\-\-help\fR, \fB\-\-version\fR, or valid \fB\-\-check\-config\fR / \fB\-\-print\-config\fR.
+.TP
+.B 1
+Runtime error (device, MPP/RGA, ALSA, I/O, or network failure).
+.TP
+.B 2
+CLI usage or configuration validation error.
+.SH EXAMPLES
+Pipe 1080p50 raw H.264 directly to \fBffplay\fR over SSH:
+.PP
+.RS
+.nf
+ssh board 'rk-hdmi-streamer -s 1920x1080 -r 50 -b 8M --rc-mode=vbr --no-audio -q -o -' | ffplay -f h264 -
+.fi
+.RE
+.PP
+Quick ad-hoc multi-stream RTSP server (LAN + car + audio-only):
+.PP
+.RS
+.nf
+rk-hdmi-streamer --stream-profile=rga -s 1920x1080 -r 50 -b 15M --rc-mode=vbr \\
+  --audio-codec=opus -l :8554 --rtsp-path=/hq --max-clients=5 \\
+  --rtsp-stream path=/coche,size=1280x720,fps=25,codec=h265,bitrate=2M,rc-mode=vbr,gop=25,send-timeout-ms=10000 \\
+  --rtsp-stream path=/audio,video=false,audio=true,send-timeout-ms=12000
+.fi
+.RE
+.PP
+Validate a config from \fBstdin\fR and trigger live stats / IDR on a running daemon:
+.PP
+.RS
+.nf
+rk-hdmi-streamer -c - --check-config < /etc/rk-hdmi-streamer.conf
+pkill -USR1 rk-hdmi-streamer   # dump live stats
+pkill -USR2 rk-hdmi-streamer   # force instant IDR keyframe
+.fi
+.RE
+.SH SEE ALSO
+.BR v4l2-ctl (1),
+.BR arecord (1),
+.BR ffmpeg (1),
+.BR pidstat (1)

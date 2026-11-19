@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Split configuration, ALSA capture, video capture and RTSP into modules linked
+  into the existing streamer executable.
+- Added `--check-config` and `--print-config`. The optional configurator
+  preserves unrelated INI settings and validates before writing when the new
+  binary is installed.
+- Replaced the diagnostic script with the configuration commands and standard
+  Linux device, socket and log tools.
+- Isolated RTSP playback state by capture generation and added retry handling
+  for capture interruptions and failed audio opens.
+- Removed system-wide CPU governor changes and the MediaMTX conflict from the
+  systemd unit. The service restarts on failure.
+- Resynchronize connected video clients when capture recovers, including clients
+  waiting for a keyframe larger than the normal queue budget.
+- Batch RTP writes within each frame and share the payload owner across its
+  fragments. Allocate the MJPEG copy buffer only when using memory-mapped
+  capture.
+- Removed the optional CPU-based JPEG decoder and its build and runtime
+  dependency. MJPEG decoding uses Rockchip MPP, including with `mmap`.
+- Release the MPP encoder's temporary header buffer before streaming frames.
+- Reuse RGA buffer descriptors between frames and free unused capture DMA-BUFs
+  when switching to mmap.
+- Reuse one MPP JPEG input packet per V4L2 DMA-BUF.
+- Added native tests for configuration, the configurator and RTSP/RTP loopback.
+  Added optional sustained RTSP tests and a multi-client FFmpeg test.
+
 ## v0.2.2
 
 - Added experimental `--video-codec h265` direct RTSP support using Rockchip

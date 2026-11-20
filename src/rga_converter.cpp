@@ -266,7 +266,10 @@ struct RgaNv12Scaler::Impl {
             src_desc = &cached_sources.back().descriptor;
         }
 
-        const auto ret = api.resize(*src_desc, destination.descriptor, 0.0, 0.0, INTER_LINEAR, 1);
+        // Let librga pick the scaler mode: forcing INTER_LINEAR (1) on an NV12
+        // downscale hangs the RGA2 core on RK3568 (driver reports "job hardware has
+        // timeout", WORK_CYCLE=0). DEFAULT, CUBIC and AVERAGE all work.
+        const auto ret = api.resize(*src_desc, destination.descriptor, 0.0, 0.0, IM_INTERP_DEFAULT, 1);
         if (ret != IM_STATUS_SUCCESS) {
             std::ostringstream oss;
             oss << "RGA NV12 scale failed: " << api.strerror(ret);

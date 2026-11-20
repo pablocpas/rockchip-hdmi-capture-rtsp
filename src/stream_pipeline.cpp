@@ -1,16 +1,23 @@
 #include "stream_pipeline.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <mutex>
 #include <optional>
 #include <poll.h>
 #include <stdexcept>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
 #include <utility>
@@ -289,17 +296,25 @@ public:
         streaming_ = false;
     }
 
-    std::optional<FrameLease> dequeue_frame() {
-        pollfd pfd{};
-        pfd.fd = fd_;
-        pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, 2000);
+    std::optional<FrameLease> dequeue_frame(int wake_fd = -1) {
+        pollfd pfds[2]{};
+        pfds[0].fd = fd_;
+        pfds[0].events = POLLIN;
+        nfds_t nfds = 1;
+        if (wake_fd >= 0) {
+            pfds[1].fd = wake_fd;
+            pfds[1].events = POLLIN;
+            nfds = 2;
+        }
+        int pr = poll(pfds, nfds, 2000);
         if (pr < 0) {
             if (errno == EINTR) return std::nullopt;
             die(std::string("V4L2 poll failed: ") + strerror(errno));
         }
         if (pr == 0) die("capture timeout");
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) die("V4L2 device unavailable");
+        if (wake_fd >= 0 && (pfds[1].revents & POLLIN)) return std::nullopt;
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) die("V4L2 device unavailable");
+        if (!(pfds[0].revents & POLLIN)) return std::nullopt;
 
         v4l2_buffer buf{};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -463,7 +478,10 @@ public:
         capture_pool_.reset();
     }
 
-    MppFrame decode_to_frame(const uint8_t *jpeg, size_t jpeg_size) {
+    static constexpr size_t frame_pool_size() { return kFramePoolSize; }
+
+    MppFrame decode_to_frame(const uint8_t *jpeg, size_t jpeg_size,
+                             std::optional<size_t> explicit_slot = std::nullopt) {
         if (jpeg_size < 4 || jpeg[0] != 0xff || jpeg[1] != 0xd8) return nullptr;
         if (jpeg_size > packet_buf_size_) die("MJPEG frame is larger than packet buffer");
 
@@ -472,10 +490,11 @@ public:
         if (sync_ret) {
             fprintf(stderr, "warning: mpp_buffer_sync_end jpeg packet failed ret=%d\n", sync_ret);
         }
-        return decode_packet(copy_packet_->prepare(jpeg_size));
+        return decode_packet(copy_packet_->prepare(jpeg_size), explicit_slot);
     }
 
-    MppFrame decode_to_frame(const CapturedFrame &captured) {
+    MppFrame decode_to_frame(const CapturedFrame &captured,
+                             std::optional<size_t> explicit_slot = std::nullopt) {
         if (captured.mpp_buffer) {
             if (captured.bytesused < 4 || captured.bytesused > captured.buffer_length) return nullptr;
             const auto index = captured.index;
@@ -483,21 +502,21 @@ public:
             if (index >= capture_packets_.size() || bufs[index] != captured.mpp_buffer) {
                 die("V4L2 returned a different DMA-BUF than the decoder input slot");
             }
-            MppFrame out = decode_packet(capture_packets_[index].prepare(captured.bytesused));
+            MppFrame out = decode_packet(capture_packets_[index].prepare(captured.bytesused), explicit_slot);
             if (out && !logged_dmabuf_active_) {
                 fprintf(stderr, "mppjpeg input path: V4L2 captured directly into MPP/DRM dma-buf, no MJPEG packet memcpy\n");
                 logged_dmabuf_active_ = true;
             }
             return out;
         }
-        return decode_to_frame(captured.data, captured.bytesused);
+        return decode_to_frame(captured.data, captured.bytesused, explicit_slot);
     }
 
 private:
     static constexpr size_t kFramePoolSize = 3;
 
-    MppFrame decode_packet(MppPacket packet) {
-        MppFrame target = next_output_frame();
+    MppFrame decode_packet(MppPacket packet, std::optional<size_t> explicit_slot) {
+        MppFrame target = explicit_slot ? output_frame_at(*explicit_slot) : next_output_frame();
         MppMeta meta = mpp_packet_get_meta(packet);
         if (!meta || mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, target)) {
             die("could not set MPP JPEG decoder output frame");
@@ -527,6 +546,11 @@ private:
         }
         if (out_fmt != MPP_FMT_YUV420SP) return nullptr;
         return out;
+    }
+
+    MppFrame output_frame_at(size_t slot) {
+        if (slot >= frame_pool_.size()) die("MPP JPEG frame slot out of range");
+        return frame_pool_[slot];
     }
 
     MppFrame next_output_frame() {
@@ -1002,6 +1026,8 @@ public:
         const bool mjpeg = opt_.input_format == "mjpeg";
         const bool use_rga = !mjpeg && opt_.yuyv_converter == "rga";
         if (mjpeg) {
+            wake_fd_.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+            if (wake_fd_.get() < 0) die(std::string("eventfd failed: ") + strerror(errno));
             mppjpeg_ = std::make_unique<MppJpegDecoder>(opt_.width, opt_.height, opt_.mppjpeg_copy_output);
             if (!opt_.v4l2_dmabuf) mppjpeg_->prepare_copy_buffer(cap_->buffer_size());
             if (opt_.mppjpeg_copy_output) {
@@ -1037,6 +1063,8 @@ public:
     }
 
     ~Impl() {
+        stop();
+        stop_scale_thread();
         streams_.clear();
         cap_.reset();
         yuyv_rga_.reset();
@@ -1141,11 +1169,14 @@ public:
             mppjpeg_->prepare_copy_buffer(cap_->buffer_size());
             cap_->start();
         }
+        if (mppjpeg_) start_decode_thread();
         started_ = true;
     }
 
     void stop() {
         if (!started_) return;
+        stop_decode_thread();
+        stop_scale_thread();
         cap_->stop();
         started_ = false;
     }
@@ -1169,70 +1200,353 @@ public:
     }
 
     bool read_frame_multi(const MultiPacketWriter &writer, CaptureStats &stats) {
+        if (mppjpeg_) {
+            DecodedFrame df{};
+            {
+                std::unique_lock<std::mutex> lock(dec_mu_);
+                dec_cv_.wait_for(lock, std::chrono::milliseconds(200), [this] {
+                    return pending_frame_.has_value() || dec_failed_ ||
+                           dec_stop_.load(std::memory_order_acquire);
+                });
+                stats.captured += dec_captured_;
+                dec_captured_ = 0;
+                stats.skipped += dec_skipped_;
+                dec_skipped_ = 0;
+
+                if (dec_failed_) {
+                    auto err = dec_error_;
+                    dec_error_ = nullptr;
+                    dec_failed_ = false;
+                    lock.unlock();
+                    stop_decode_thread();
+                    if (err) std::rethrow_exception(err);
+                    return false;
+                }
+                if (!pending_frame_) return false;
+                df = *pending_frame_;
+                pending_frame_.reset();
+                consumer_slot_ = static_cast<int>(df.slot);
+            }
+
+            struct SlotReleaseGuard {
+                Impl *self;
+                ~SlotReleaseGuard() {
+                    std::lock_guard<std::mutex> lock(self->dec_mu_);
+                    self->consumer_slot_ = -1;
+                }
+            } release_guard{this};
+
+            return encode_nv12_frame(df.nv12_buf, df.hor_stride, df.ver_stride, df.timestamp_ns, writer);
+        }
+
         auto lease = cap_->dequeue_frame();
         if (!lease) return false;
 
         ++stats.captured;
         const uint64_t timestamp_ns = lease->frame().timestamp_ns;
 
-        MppBuffer nv12_buf = nullptr;
-        int src_hor_stride = cap_hor_stride_;
-        int src_ver_stride = cap_ver_stride_;
-
-        if (opt_.input_format == "yuyv") {
-            if (opt_.yuyv_converter == "rga") {
-                yuyv_rga_->convert(lease->frame());
-            } else {
-                const auto &f = lease->frame();
-                convert_yuyv_to_nv12_buffer(f.data, f.bytesused, f.bytesperline,
-                                            opt_.width, opt_.height, cap_hor_stride_, cap_ver_stride_,
-                                            shared_nv12_buf_);
-            }
-            lease->requeue();
-            nv12_buf = shared_nv12_buf_;
+        if (opt_.yuyv_converter == "rga") {
+            yuyv_rga_->convert(lease->frame());
         } else {
-            MppFrame frame = mppjpeg_->decode_to_frame(lease->frame());
-            lease->requeue();
-            if (!frame) {
-                ++stats.skipped;
-                if (stats.skipped <= 10 || stats.skipped % opt_.fps == 0) {
-                    fprintf(stderr, "skipped corrupt/unsupported MJPEG frame captured=%llu skipped=%llu\n",
-                            static_cast<unsigned long long>(stats.captured),
-                            static_cast<unsigned long long>(stats.skipped));
+            const auto &f = lease->frame();
+            convert_yuyv_to_nv12_buffer(f.data, f.bytesused, f.bytesperline,
+                                        opt_.width, opt_.height, cap_hor_stride_, cap_ver_stride_,
+                                        shared_nv12_buf_);
+        }
+        lease->requeue();
+        return encode_nv12_frame(shared_nv12_buf_, cap_hor_stride_, cap_ver_stride_, timestamp_ns, writer);
+    }
+
+private:
+    struct DecodedFrame {
+        size_t slot = 0;
+        MppBuffer nv12_buf = nullptr;
+        int hor_stride = 0;
+        int ver_stride = 0;
+        uint64_t timestamp_ns = 0;
+    };
+
+    bool encode_nv12_frame(MppBuffer nv12_buf, int src_hor_stride, int src_ver_stride,
+                           uint64_t timestamp_ns, const MultiPacketWriter &writer) {
+        direct_batch_.clear();
+        rga_scale_batch_.clear();
+        cpu_scale_batch_.clear();
+        for (auto &stream : streams_) {
+            if (!stream->should_encode(opt_.fps)) continue;
+            if (stream->needs_scale) {
+                if (stream->rga_scaler) {
+                    rga_scale_batch_.push_back(stream.get());
+                } else {
+                    cpu_scale_batch_.push_back(stream.get());
                 }
-                return false;
+            } else {
+                direct_batch_.push_back(stream.get());
             }
-            nv12_buf = mpp_frame_get_buffer(frame);
-            src_hor_stride = static_cast<int>(mpp_frame_get_hor_stride(frame));
-            src_ver_stride = static_cast<int>(mpp_frame_get_ver_stride(frame));
+        }
+        if (direct_batch_.empty() && rga_scale_batch_.empty() && cpu_scale_batch_.empty()) {
+            return false;
         }
 
         const int src_fd = mpp_buffer_get_fd(nv12_buf);
         bool any_encoded = false;
-        for (auto &stream : streams_) {
-            if (!stream->should_encode(opt_.fps)) continue;
+        auto encode_direct = [&](StreamOutput *stream) {
             auto stream_writer = [&](EncodedPacket packet) {
                 writer(stream->id, std::move(packet), timestamp_ns);
                 any_encoded = true;
             };
-            if (stream->needs_scale) {
-                if (stream->rga_scaler) {
-                    stream->rga_scaler->scale(src_fd, opt_.width, opt_.height, src_hor_stride, src_ver_stride);
-                    stream->encoder->submit_nv12_frame(stream_writer);
-                } else {
-                    stream->encoder->encode_nv12_buffer_scale_cpu(
-                        nv12_buf, opt_.width, opt_.height, src_hor_stride, src_ver_stride, stream_writer);
-                }
-            } else if (stream->copy_nv12) {
+            if (stream->copy_nv12) {
                 stream->encoder->encode_nv12_buffer_copy(nv12_buf, src_hor_stride, src_ver_stride, stream_writer);
             } else {
                 stream->encoder->encode_nv12_buffer(nv12_buf, src_hor_stride, src_ver_stride, stream_writer);
             }
+        };
+
+        if (!direct_batch_.empty() && !rga_scale_batch_.empty()) {
+            // Overlap RGA2 downscaling with the first direct VEPU encode: both read
+            // the immutable NV12 DMA-BUF concurrently and write to separate buffers.
+            start_async_rga_scale(src_fd, src_hor_stride, src_ver_stride);
+            struct ScaleWaitGuard {
+                Impl *self;
+                bool waited = false;
+                ~ScaleWaitGuard() {
+                    if (!waited) self->wait_async_rga_scale_nothrow();
+                }
+            } scale_guard{this};
+
+            encode_direct(direct_batch_[0]);
+            scale_guard.waited = true;
+            wait_async_rga_scale();
+
+            for (size_t i = 1; i < direct_batch_.size(); ++i) {
+                encode_direct(direct_batch_[i]);
+            }
+            for (StreamOutput *stream : rga_scale_batch_) {
+                auto stream_writer = [&](EncodedPacket packet) {
+                    writer(stream->id, std::move(packet), timestamp_ns);
+                    any_encoded = true;
+                };
+                stream->encoder->submit_nv12_frame(stream_writer);
+            }
+        } else {
+            for (StreamOutput *stream : direct_batch_) {
+                encode_direct(stream);
+            }
+            for (StreamOutput *stream : rga_scale_batch_) {
+                stream->rga_scaler->scale(src_fd, opt_.width, opt_.height, src_hor_stride, src_ver_stride);
+                auto stream_writer = [&](EncodedPacket packet) {
+                    writer(stream->id, std::move(packet), timestamp_ns);
+                    any_encoded = true;
+                };
+                stream->encoder->submit_nv12_frame(stream_writer);
+            }
+        }
+
+        for (StreamOutput *stream : cpu_scale_batch_) {
+            auto stream_writer = [&](EncodedPacket packet) {
+                writer(stream->id, std::move(packet), timestamp_ns);
+                any_encoded = true;
+            };
+            stream->encoder->encode_nv12_buffer_scale_cpu(
+                nv12_buf, opt_.width, opt_.height, src_hor_stride, src_ver_stride, stream_writer);
         }
         return any_encoded;
     }
 
-private:
+    void start_async_rga_scale(int src_fd, int src_hor_stride, int src_ver_stride) {
+        if (!scale_thread_.joinable()) {
+            scale_stop_ = false;
+            scale_has_job_ = false;
+            scale_done_ = false;
+            scale_error_ = nullptr;
+            scale_thread_ = std::thread([this] { scale_loop(); });
+        }
+        {
+            std::lock_guard<std::mutex> lock(scale_mu_);
+            scale_src_fd_ = src_fd;
+            scale_src_hor_stride_ = src_hor_stride;
+            scale_src_ver_stride_ = src_ver_stride;
+            scale_error_ = nullptr;
+            scale_done_ = false;
+            scale_has_job_ = true;
+        }
+        scale_cv_.notify_one();
+    }
+
+    void wait_async_rga_scale() {
+        std::unique_lock<std::mutex> lock(scale_mu_);
+        scale_cv_.wait(lock, [this] { return scale_done_; });
+        auto err = scale_error_;
+        scale_error_ = nullptr;
+        scale_done_ = false;
+        if (err) std::rethrow_exception(err);
+    }
+
+    void wait_async_rga_scale_nothrow() noexcept {
+        std::unique_lock<std::mutex> lock(scale_mu_);
+        scale_cv_.wait(lock, [this] { return scale_done_; });
+        scale_error_ = nullptr;
+        scale_done_ = false;
+    }
+
+    void stop_scale_thread() {
+        if (!scale_thread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(scale_mu_);
+            scale_stop_ = true;
+        }
+        scale_cv_.notify_all();
+        scale_thread_.join();
+        scale_stop_ = false;
+        scale_has_job_ = false;
+        scale_done_ = false;
+        scale_error_ = nullptr;
+    }
+
+    void scale_loop() {
+        for (;;) {
+            int src_fd = -1;
+            int src_hor_stride = 0;
+            int src_ver_stride = 0;
+            {
+                std::unique_lock<std::mutex> lock(scale_mu_);
+                scale_cv_.wait(lock, [this] { return scale_has_job_ || scale_stop_; });
+                if (scale_stop_ && !scale_has_job_) return;
+                src_fd = scale_src_fd_;
+                src_hor_stride = scale_src_hor_stride_;
+                src_ver_stride = scale_src_ver_stride_;
+                scale_has_job_ = false;
+            }
+            std::exception_ptr err;
+            try {
+                for (StreamOutput *stream : rga_scale_batch_) {
+                    stream->rga_scaler->scale(src_fd, opt_.width, opt_.height, src_hor_stride, src_ver_stride);
+                }
+            } catch (...) {
+                err = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lock(scale_mu_);
+                scale_error_ = err;
+                scale_done_ = true;
+            }
+            scale_cv_.notify_one();
+        }
+    }
+
+    size_t pick_free_slot_locked() const {
+        const size_t n = MppJpegDecoder::frame_pool_size();
+        for (size_t s = 0; s < n; ++s) {
+            if (static_cast<int>(s) == consumer_slot_) continue;
+            if (pending_frame_ && pending_frame_->slot == s) continue;
+            return s;
+        }
+        die("no free MJPEG decoder slot available");
+    }
+
+    struct UniqueFd {
+        int fd = -1;
+        UniqueFd() = default;
+        ~UniqueFd() { reset(-1); }
+        UniqueFd(const UniqueFd &) = delete;
+        UniqueFd &operator=(const UniqueFd &) = delete;
+        int get() const { return fd; }
+        void reset(int new_fd) {
+            if (fd >= 0) close(fd);
+            fd = new_fd;
+        }
+    };
+
+    void start_decode_thread() {
+        stop_decode_thread();
+        if (wake_fd_.get() >= 0) {
+            uint64_t dummy = 0;
+            while (read(wake_fd_.get(), &dummy, sizeof(dummy)) > 0) {}
+        }
+        {
+            std::lock_guard<std::mutex> lock(dec_mu_);
+            pending_frame_.reset();
+            consumer_slot_ = -1;
+            dec_captured_ = 0;
+            dec_skipped_ = 0;
+            dec_failed_ = false;
+            dec_error_ = nullptr;
+        }
+        dec_stop_.store(false, std::memory_order_release);
+        decode_thread_ = std::thread([this] { decode_loop(); });
+    }
+
+    void stop_decode_thread() {
+        dec_stop_.store(true, std::memory_order_release);
+        if (wake_fd_.get() >= 0) {
+            const uint64_t one = 1;
+            (void)write(wake_fd_.get(), &one, sizeof(one));
+        }
+        dec_cv_.notify_all();
+        if (decode_thread_.joinable()) decode_thread_.join();
+        std::lock_guard<std::mutex> lock(dec_mu_);
+        pending_frame_.reset();
+        consumer_slot_ = -1;
+    }
+
+    void decode_loop() {
+        uint64_t total_captured = 0;
+        uint64_t total_corrupt = 0;
+        try {
+            while (!dec_stop_.load(std::memory_order_acquire)) {
+                auto lease = cap_->dequeue_frame(wake_fd_.get());
+                if (!lease) continue;
+
+                const uint64_t timestamp_ns = lease->frame().timestamp_ns;
+                ++total_captured;
+                size_t slot = 0;
+                {
+                    std::lock_guard<std::mutex> lock(dec_mu_);
+                    ++dec_captured_;
+                    slot = pick_free_slot_locked();
+                }
+
+                MppFrame frame = mppjpeg_->decode_to_frame(lease->frame(), slot);
+                lease->requeue();
+                if (!frame) {
+                    ++total_corrupt;
+                    {
+                        std::lock_guard<std::mutex> lock(dec_mu_);
+                        ++dec_skipped_;
+                    }
+                    if (total_corrupt <= 10 || total_corrupt % opt_.fps == 0) {
+                        fprintf(stderr, "skipped corrupt/unsupported MJPEG frame captured=%llu skipped=%llu\n",
+                                static_cast<unsigned long long>(total_captured),
+                                static_cast<unsigned long long>(total_corrupt));
+                    }
+                    continue;
+                }
+
+                DecodedFrame df{};
+                df.slot = slot;
+                df.nv12_buf = mpp_frame_get_buffer(frame);
+                df.hor_stride = static_cast<int>(mpp_frame_get_hor_stride(frame));
+                df.ver_stride = static_cast<int>(mpp_frame_get_ver_stride(frame));
+                df.timestamp_ns = timestamp_ns;
+
+                {
+                    std::lock_guard<std::mutex> lock(dec_mu_);
+                    if (pending_frame_) {
+                        ++dec_skipped_;
+                    }
+                    pending_frame_ = df;
+                }
+                dec_cv_.notify_one();
+            }
+        } catch (...) {
+            if (!dec_stop_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(dec_mu_);
+                dec_error_ = std::current_exception();
+                dec_failed_ = true;
+            }
+            dec_cv_.notify_all();
+        }
+    }
+
     struct StreamOutput {
         int id = 0;
         Options opt;
@@ -1263,6 +1577,30 @@ private:
     std::unique_ptr<RgaYuyvToNv12Converter> yuyv_rga_;
     std::vector<std::unique_ptr<StreamOutput>> streams_;
     bool started_ = false;
+    UniqueFd wake_fd_;
+    std::atomic<bool> dec_stop_{false};
+    std::mutex dec_mu_;
+    std::condition_variable dec_cv_;
+    std::optional<DecodedFrame> pending_frame_;
+    int consumer_slot_ = -1;
+    uint64_t dec_captured_ = 0;
+    uint64_t dec_skipped_ = 0;
+    bool dec_failed_ = false;
+    std::exception_ptr dec_error_;
+    std::thread decode_thread_;
+    std::vector<StreamOutput *> direct_batch_;
+    std::vector<StreamOutput *> rga_scale_batch_;
+    std::vector<StreamOutput *> cpu_scale_batch_;
+    std::mutex scale_mu_;
+    std::condition_variable scale_cv_;
+    bool scale_stop_ = false;
+    bool scale_has_job_ = false;
+    bool scale_done_ = false;
+    int scale_src_fd_ = -1;
+    int scale_src_hor_stride_ = 0;
+    int scale_src_ver_stride_ = 0;
+    std::exception_ptr scale_error_;
+    std::thread scale_thread_;
 };
 
 StreamPipeline::StreamPipeline(const Options &capture_opt, bool enable_default_encoder)
